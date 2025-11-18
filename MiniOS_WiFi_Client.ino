@@ -316,7 +316,15 @@ void connectWebSocket() {
   Serial.print(":");
   Serial.println(BACKEND_PORT);
 
-  webSocket.begin(BACKEND_HOST.c_str(), BACKEND_PORT, "/ws/device");
+  // Usar SSL para puerto 443, sin SSL para otros puertos
+  if (BACKEND_PORT == 443) {
+    Serial.println("Usando conexión SSL (wss://)");
+    webSocket.beginSSL(BACKEND_HOST.c_str(), BACKEND_PORT, "/ws/device");
+  } else {
+    Serial.println("Usando conexión sin SSL (ws://)");
+    webSocket.begin(BACKEND_HOST.c_str(), BACKEND_PORT, "/ws/device");
+  }
+
   webSocket.onEvent(webSocketEvent);
   webSocket.setReconnectInterval(5000);
 }
