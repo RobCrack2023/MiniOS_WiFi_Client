@@ -366,7 +366,7 @@ void webSocketEvent(WStype_t type, uint8_t* payload, size_t length) {
 }
 
 void registerDevice() {
-  StaticJsonDocument<256> doc;
+  StaticJsonDocument<512> doc;
   doc["type"] = "register";
   doc["mac_address"] = deviceMac;
   doc["firmware_version"] = FIRMWARE_VERSION;
@@ -374,9 +374,12 @@ void registerDevice() {
 
   String json;
   serializeJson(doc, json);
-  webSocket.sendTXT(json);
 
-  Serial.println("📱 Registro enviado al backend");
+  // Debug: mostrar lo que se envía
+  Serial.println("📱 Enviando registro al backend:");
+  Serial.println(json);
+
+  webSocket.sendTXT(json);
 }
 
 void handleWebSocketMessage(const char* payload) {
