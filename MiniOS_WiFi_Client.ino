@@ -165,10 +165,21 @@ void setup() {
   pinMode(LED_STATUS, OUTPUT);
   digitalWrite(LED_STATUS, LOW);
 
+  // Inicializar WiFi para obtener MAC
+  WiFi.mode(WIFI_STA);
+
   // Obtener MAC
   deviceMac = WiFi.macAddress();
   Serial.print("MAC Address: ");
   Serial.println(deviceMac);
+
+  if (deviceMac == "00:00:00:00:00:00" || deviceMac.length() == 0) {
+    Serial.println("⚠️  Error obteniendo MAC, reintentando...");
+    delay(100);
+    deviceMac = WiFi.macAddress();
+    Serial.print("MAC Address: ");
+    Serial.println(deviceMac);
+  }
 
   // Cargar configuración guardada
   loadConfig();
