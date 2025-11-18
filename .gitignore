@@ -1,0 +1,11 @@
+# Claude Code
+.claude/
+
+# Build files
+build/
+.pio/
+
+# IDE
+.vscode/
+*.swp
+*.swo
