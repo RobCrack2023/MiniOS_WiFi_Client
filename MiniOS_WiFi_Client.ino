@@ -747,14 +747,31 @@ void reportOTAStatus(const char* status, String error) {
 void loadConfig() {
   preferences.begin("minios", true);
 
-  WIFI_SSID = preferences.getString("wifi_ssid", "");
-  WIFI_PASS = preferences.getString("wifi_pass", "");
-  BACKEND_HOST = preferences.getString("backend_host", "");
-  BACKEND_PORT = preferences.getInt("backend_port", 3000);
+  // Usar valores hardcodeados como default si no hay nada en NVS
+  String savedSSID = preferences.getString("wifi_ssid", "");
+  String savedPass = preferences.getString("wifi_pass", "");
+  String savedHost = preferences.getString("backend_host", "");
+  int savedPort = preferences.getInt("backend_port", 0);
+
+  // Solo sobrescribir si hay valores guardados
+  if (savedSSID.length() > 0) {
+    WIFI_SSID = savedSSID;
+    WIFI_PASS = savedPass;
+  }
+  if (savedHost.length() > 0) {
+    BACKEND_HOST = savedHost;
+    BACKEND_PORT = savedPort;
+  }
 
   preferences.end();
 
   Serial.println("Configuración cargada");
+  Serial.print("WiFi SSID: ");
+  Serial.println(WIFI_SSID);
+  Serial.print("Backend: ");
+  Serial.print(BACKEND_HOST);
+  Serial.print(":");
+  Serial.println(BACKEND_PORT);
 }
 
 void saveConfig() {
