@@ -79,6 +79,13 @@ struct GPIOConfig {
   unsigned long loopInterval;
   unsigned long lastLoop;
   bool isAnalog;       // True si es pin analógico (ADC)
+  // Fórmulas de conversión para sensores analógicos
+  bool formulaEnabled;
+  String formulaType;  // "4-20mA", "0-10V", "0-3.3V", "custom"
+  float formulaMin;    // Valor mínimo de la escala
+  float formulaMax;    // Valor máximo de la escala
+  float convertedValue; // Valor después de aplicar fórmula
+  String unit;         // Unidad (°C, %, PSI, etc.)
 };
 
 struct DHTConfig {
@@ -148,6 +155,7 @@ bool GPIO_InList(int pin, const int* list, int count);
 bool GPIO_IsValid(int pin);
 bool GPIO_IsAnalog(int pin);
 bool GPIO_IsAppropriate(int pin, GPIOMode mode);
+float applyFormula(int rawValue, GPIOConfig& gpio);
 
 // ============================================
 // SETUP
@@ -276,6 +284,47 @@ bool GPIO_IsAppropriate(int pin, GPIOMode mode) {
     default:
       return false;
   }
+}
+
+// Aplicar fórmula de conversión a valor analógico
+float applyFormula(int rawValue, GPIOConfig& gpio) {
+  if (!gpio.formulaEnabled || !gpio.isAnalog) {
+    return (float)rawValue;
+  }
+
+  float voltage = (rawValue * 3.3) / 4095.0;
+  float normalized = 0;
+
+  if (gpio.formulaType == "4-20mA") {
+    // Sensor 4-20mA con resistencia 250Ω
+    // Voltaje = Corriente * Resistencia
+    // Corriente (mA) = Voltaje / 0.250
+    float current = voltage / 0.250;  // mA
+    // Normalizar: 4mA = 0%, 20mA = 100%
+    normalized = (current - 4.0) / 16.0;
+  }
+  else if (gpio.formulaType == "0-10V") {
+    // Sensor 0-10V con divisor de voltaje 1:4
+    // Voltaje real = voltaje leído * 4
+    float realVoltage = voltage * 4.0;
+    // Normalizar: 0V = 0%, 10V = 100%
+    normalized = realVoltage / 10.0;
+  }
+  else if (gpio.formulaType == "0-3.3V") {
+    // Voltaje directo 0-3.3V
+    normalized = voltage / 3.3;
+  }
+  else {
+    // Custom o desconocido: usar valor RAW normalizado
+    normalized = rawValue / 4095.0;
+  }
+
+  // Limitar entre 0 y 1
+  if (normalized < 0) normalized = 0;
+  if (normalized > 1) normalized = 1;
+
+  // Escalar al rango min-max
+  return gpio.formulaMin + (normalized * (gpio.formulaMax - gpio.formulaMin));
 }
 
 // ============================================
@@ -456,6 +505,14 @@ void handleConfig(JsonDocument& doc) {
     gpios[gpioCount].isAnalog = GPIO_IsAnalog(pin);
     gpios[gpioCount].mode = mode;
 
+    // Configuración de fórmulas para sensores analógicos
+    gpios[gpioCount].formulaEnabled = gpio["formula_enabled"] | false;
+    gpios[gpioCount].formulaType = gpio["formula_type"].as<String>();
+    gpios[gpioCount].formulaMin = gpio["formula_min"] | 0.0;
+    gpios[gpioCount].formulaMax = gpio["formula_max"] | 100.0;
+    gpios[gpioCount].unit = gpio["unit"].as<String>();
+    gpios[gpioCount].convertedValue = 0;
+
     // Aplicar configuración física
     switch (mode) {
       case MODE_OUTPUT:
@@ -588,6 +645,14 @@ void handleCommand(JsonDocument& doc) {
       gpios[gpioCount].isAnalog = GPIO_IsAnalog(pin);
       gpios[gpioCount].mode = mode;
 
+      // Configuración de fórmulas para sensores analógicos
+      gpios[gpioCount].formulaEnabled = gpio["formula_enabled"] | false;
+      gpios[gpioCount].formulaType = gpio["formula_type"].as<String>();
+      gpios[gpioCount].formulaMin = gpio["formula_min"] | 0.0;
+      gpios[gpioCount].formulaMax = gpio["formula_max"] | 100.0;
+      gpios[gpioCount].unit = gpio["unit"].as<String>();
+      gpios[gpioCount].convertedValue = 0;
+
       switch (mode) {
         case MODE_OUTPUT:
           pinMode(pin, OUTPUT);
@@ -705,6 +770,18 @@ void sendSensorData() {
           // Lectura analógica (0-4095)
           gpios[i].value = analogRead(gpios[i].pin);
           g["analog"] = true;
+          g["raw"] = gpios[i].value;
+
+          // Aplicar fórmula si está habilitada
+          if (gpios[i].formulaEnabled) {
+            gpios[i].convertedValue = applyFormula(gpios[i].value, gpios[i]);
+            g["converted"] = gpios[i].convertedValue;
+            g["unit"] = gpios[i].unit;
+            g["formula_type"] = gpios[i].formulaType;
+
+            Serial.printf("GPIO[%d] pin:%d raw:%d -> %.2f %s\n",
+              i, gpios[i].pin, gpios[i].value, gpios[i].convertedValue, gpios[i].unit.c_str());
+          }
         } else {
           // Lectura digital (0/1)
           gpios[i].value = digitalRead(gpios[i].pin);
