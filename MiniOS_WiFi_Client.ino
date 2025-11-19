@@ -554,11 +554,99 @@ void handleCommand(JsonDocument& doc) {
     }
   }
   else if (strcmp(action, "update_gpio") == 0) {
-    // Reconfigurar todos los GPIOs
-    handleConfig(doc);
+    // Reconfigurar GPIOs
+    Serial.println("📥 Recibida actualización de GPIO");
+
+    JsonArray gpioArray = doc["gpio"].as<JsonArray>();
+    gpioCount = 0;
+
+    for (JsonObject gpio : gpioArray) {
+      if (gpioCount >= MAX_GPIOS) break;
+
+      int pin = gpio["pin"];
+      String modeStr = gpio["mode"].as<String>();
+
+      GPIOMode mode;
+      if (modeStr == "OUTPUT") mode = MODE_OUTPUT;
+      else if (modeStr == "INPUT") mode = MODE_INPUT;
+      else if (modeStr == "INPUT_PULLUP") mode = MODE_INPUT_PULLUP;
+      else if (modeStr == "PWM") mode = MODE_PWM;
+      else continue;
+
+      if (!GPIO_IsValid(pin) || !GPIO_IsAppropriate(pin, mode)) {
+        Serial.printf("[GPIO] Pin %d no válido para modo %s\n", pin, modeStr.c_str());
+        continue;
+      }
+
+      gpios[gpioCount].pin = pin;
+      gpios[gpioCount].name = gpio["name"].as<String>();
+      gpios[gpioCount].value = gpio["value"];
+      gpios[gpioCount].active = gpio["active"];
+      gpios[gpioCount].loopEnabled = gpio["loop_enabled"];
+      gpios[gpioCount].loopInterval = gpio["loop_interval"];
+      gpios[gpioCount].lastLoop = 0;
+      gpios[gpioCount].isAnalog = GPIO_IsAnalog(pin);
+      gpios[gpioCount].mode = mode;
+
+      switch (mode) {
+        case MODE_OUTPUT:
+          pinMode(pin, OUTPUT);
+          digitalWrite(pin, gpios[gpioCount].value);
+          break;
+        case MODE_INPUT:
+          pinMode(pin, INPUT);
+          break;
+        case MODE_INPUT_PULLUP:
+          pinMode(pin, INPUT_PULLUP);
+          break;
+        case MODE_PWM:
+          ledcAttach(pin, 5000, 8);
+          ledcWrite(pin, gpios[gpioCount].value);
+          break;
+      }
+
+      gpioCount++;
+    }
+
+    Serial.printf("GPIOs actualizados: %d\n", gpioCount);
   }
   else if (strcmp(action, "update_dht") == 0) {
-    handleConfig(doc);
+    // Reconfigurar sensores DHT
+    Serial.println("📥 Recibida actualización de DHT");
+
+    JsonArray dhtArray = doc["dht"].as<JsonArray>();
+
+    // Limpiar sensores anteriores
+    for (int i = 0; i < dhtCount; i++) {
+      if (dhtSensors[i].sensor) {
+        delete dhtSensors[i].sensor;
+      }
+    }
+    dhtCount = 0;
+
+    for (JsonObject dht : dhtArray) {
+      if (dhtCount >= MAX_DHT_SENSORS) break;
+
+      int pin = dht["pin"];
+      String type = dht["sensor_type"].as<String>();
+
+      dhtSensors[dhtCount].pin = pin;
+      dhtSensors[dhtCount].name = dht["name"].as<String>();
+      dhtSensors[dhtCount].type = type;
+      dhtSensors[dhtCount].active = dht["active"];
+      dhtSensors[dhtCount].readInterval = dht["read_interval"] | 5000;
+      dhtSensors[dhtCount].lastRead = 0;
+      dhtSensors[dhtCount].temperature = 0;
+      dhtSensors[dhtCount].humidity = 0;
+
+      uint8_t dhtType = (type == "DHT22") ? DHT22 : DHT11;
+      dhtSensors[dhtCount].sensor = new DHT(pin, dhtType);
+      dhtSensors[dhtCount].sensor->begin();
+
+      dhtCount++;
+    }
+
+    Serial.printf("Sensores DHT actualizados: %d\n", dhtCount);
   }
   else if (strcmp(action, "reboot") == 0) {
     Serial.println("🔄 Reiniciando...");
