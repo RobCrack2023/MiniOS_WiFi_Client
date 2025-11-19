@@ -678,12 +678,15 @@ void sendSensorData() {
   if (dhtCount > 0) {
     JsonArray dhtArray = payload.createNestedArray("dht");
     for (int i = 0; i < dhtCount; i++) {
-      if (dhtSensors[i].active && !isnan(dhtSensors[i].temperature)) {
+      if (dhtSensors[i].active) {
         JsonObject d = dhtArray.createNestedObject();
         d["pin"] = dhtSensors[i].pin;
         d["name"] = dhtSensors[i].name;
         d["temperature"] = dhtSensors[i].temperature;
         d["humidity"] = dhtSensors[i].humidity;
+
+        Serial.printf("DHT[%d] pin:%d temp:%.1f hum:%.1f\n",
+          i, dhtSensors[i].pin, dhtSensors[i].temperature, dhtSensors[i].humidity);
       }
     }
   }
@@ -734,6 +737,8 @@ void readDHTSensors() {
       if (!isnan(h) && !isnan(t)) {
         dhtSensors[i].temperature = t;
         dhtSensors[i].humidity = h;
+      } else {
+        Serial.printf("⚠️ Error leyendo DHT pin %d\n", dhtSensors[i].pin);
       }
     }
   }
