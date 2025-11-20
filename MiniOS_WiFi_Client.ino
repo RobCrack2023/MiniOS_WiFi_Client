@@ -18,6 +18,7 @@
 #include <Update.h>
 #include <Preferences.h>
 #include <DHT.h>
+#include <Adafruit_NeoPixel.h>
 
 // ============================================
 // CONFIGURACIÓN
@@ -37,6 +38,8 @@ int BACKEND_PORT = 443;  // Puerto 80 con Nginx, 443 con SSL
 #define MAX_GPIOS 20
 #define MAX_DHT_SENSORS 4
 #define LED_STATUS 2  // LED integrado
+#define LED_RGB_PIN 48  // LED RGB NeoPixel integrado ESP32-S3
+#define LED_RGB_COUNT 1
 
 // ============================================
 // CLASIFICACIÓN DE GPIOs ESP32-S3
@@ -106,6 +109,7 @@ struct DHTConfig {
 
 WebSocketsClient webSocket;
 Preferences preferences;
+Adafruit_NeoPixel rgbLed(LED_RGB_COUNT, LED_RGB_PIN, NEO_GRB + NEO_KHZ800);
 
 GPIOConfig gpios[MAX_GPIOS];
 int gpioCount = 0;
@@ -157,6 +161,9 @@ bool GPIO_IsAnalog(int pin);
 bool GPIO_IsAppropriate(int pin, GPIOMode mode);
 float applyFormula(int rawValue, GPIOConfig& gpio);
 
+// LED RGB
+void blinkRGB(uint8_t r, uint8_t g, uint8_t b, int duration = 50);
+
 // ============================================
 // SETUP
 // ============================================
@@ -172,6 +179,12 @@ void setup() {
   // LED de estado
   pinMode(LED_STATUS, OUTPUT);
   digitalWrite(LED_STATUS, LOW);
+
+  // LED RGB NeoPixel
+  rgbLed.begin();
+  rgbLed.setBrightness(50);  // Brillo moderado (0-255)
+  rgbLed.clear();
+  rgbLed.show();
 
   // Inicializar WiFi para obtener MAC
   WiFi.mode(WIFI_STA);
@@ -328,6 +341,18 @@ float applyFormula(int rawValue, GPIOConfig& gpio) {
 }
 
 // ============================================
+// LED RGB
+// ============================================
+
+void blinkRGB(uint8_t r, uint8_t g, uint8_t b, int duration) {
+  rgbLed.setPixelColor(0, rgbLed.Color(r, g, b));
+  rgbLed.show();
+  delay(duration);
+  rgbLed.clear();
+  rgbLed.show();
+}
+
+// ============================================
 // WIFI
 // ============================================
 
@@ -406,6 +431,7 @@ void webSocketEvent(WStype_t type, uint8_t* payload, size_t length) {
       break;
 
     case WStype_TEXT:
+      blinkRGB(0, 0, 255);  // Azul: mensaje recibido
       handleWebSocketMessage((char*)payload);
       break;
 
@@ -433,6 +459,7 @@ void registerDevice() {
   Serial.println(json);
 
   webSocket.sendTXT(json);
+  blinkRGB(0, 255, 0);  // Verde: datos enviados
 }
 
 void handleWebSocketMessage(const char* payload) {
@@ -799,6 +826,7 @@ void sendSensorData() {
   String json;
   serializeJson(doc, json);
   webSocket.sendTXT(json);
+  blinkRGB(0, 255, 0);  // Verde: datos enviados
 }
 
 // ============================================
