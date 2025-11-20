@@ -387,6 +387,10 @@ void connectWebSocket() {
 
   webSocket.onEvent(webSocketEvent);
   webSocket.setReconnectInterval(5000);
+
+  // Heartbeat para mantener conexión viva y detectar desconexiones
+  // Ping cada 15s, timeout 3s, 2 intentos antes de reconectar
+  webSocket.enableHeartbeat(15000, 3000, 2);
 }
 
 void webSocketEvent(WStype_t type, uint8_t* payload, size_t length) {
