@@ -37,6 +37,7 @@ int BACKEND_PORT = 443;  // Puerto 80 con Nginx, 443 con SSL
 // Hardware
 #define MAX_GPIOS 20
 #define MAX_DHT_SENSORS 4
+#define MAX_ULTRASONIC_SENSORS 4
 #define LED_STATUS 2  // LED integrado
 #define LED_RGB_PIN 48  // LED RGB NeoPixel integrado ESP32-S3
 #define LED_RGB_COUNT 1
@@ -103,6 +104,25 @@ struct DHTConfig {
   unsigned long lastRead;
 };
 
+struct UltrasonicConfig {
+  int id;
+  int trigPin;
+  int echoPin;
+  String name;
+  int maxDistance;          // cm
+  bool detectionEnabled;
+  int triggerDistance;      // cm
+  int triggerGpioPin;
+  int triggerGpioValue;
+  int triggerDuration;      // ms (0 = mantener)
+  bool active;
+  unsigned long readInterval;
+  unsigned long lastRead;
+  float lastDistance;
+  bool triggered;
+  unsigned long triggerStartTime;
+};
+
 // ============================================
 // VARIABLES GLOBALES
 // ============================================
@@ -116,6 +136,9 @@ int gpioCount = 0;
 
 DHTConfig dhtSensors[MAX_DHT_SENSORS];
 int dhtCount = 0;
+
+UltrasonicConfig ultrasonicSensors[MAX_ULTRASONIC_SENSORS];
+int ultrasonicCount = 0;
 
 String deviceMac;
 int deviceId = 0;
@@ -160,6 +183,11 @@ bool GPIO_IsValid(int pin);
 bool GPIO_IsAnalog(int pin);
 bool GPIO_IsAppropriate(int pin, GPIOMode mode);
 float applyFormula(int rawValue, GPIOConfig& gpio);
+
+// Ultrasonic HC-SR04
+float readUltrasonic(int trigPin, int echoPin, int maxDistance);
+void readUltrasonicSensors();
+void processUltrasonicTriggers();
 
 // LED RGB
 void blinkRGB(uint8_t r, uint8_t g, uint8_t b, int duration = 50);
@@ -242,6 +270,12 @@ void loop() {
 
   // Leer sensores DHT
   readDHTSensors();
+
+  // Leer sensores ultrasónicos
+  readUltrasonicSensors();
+
+  // Procesar triggers de ultrasónicos
+  processUltrasonicTriggers();
 
   // Procesar loops GPIO
   processGpioLoops();
@@ -604,6 +638,51 @@ void handleConfig(JsonDocument& doc) {
   Serial.print("Sensores DHT configurados: ");
   Serial.println(dhtCount);
 
+  // Configurar sensores ultrasónicos
+  JsonArray ultrasonicArray = doc["ultrasonic"].as<JsonArray>();
+  ultrasonicCount = 0;
+
+  for (JsonObject us : ultrasonicArray) {
+    if (ultrasonicCount >= MAX_ULTRASONIC_SENSORS) break;
+
+    int trigPin = us["trig_pin"];
+    int echoPin = us["echo_pin"];
+
+    ultrasonicSensors[ultrasonicCount].id = us["id"];
+    ultrasonicSensors[ultrasonicCount].trigPin = trigPin;
+    ultrasonicSensors[ultrasonicCount].echoPin = echoPin;
+    ultrasonicSensors[ultrasonicCount].name = us["name"].as<String>();
+    ultrasonicSensors[ultrasonicCount].maxDistance = us["max_distance"] | 400;
+    ultrasonicSensors[ultrasonicCount].detectionEnabled = us["detection_enabled"] | true;
+    ultrasonicSensors[ultrasonicCount].triggerDistance = us["trigger_distance"] | 50;
+    ultrasonicSensors[ultrasonicCount].triggerGpioPin = us["trigger_gpio_pin"] | -1;
+    ultrasonicSensors[ultrasonicCount].triggerGpioValue = us["trigger_gpio_value"] | 1;
+    ultrasonicSensors[ultrasonicCount].triggerDuration = us["trigger_duration"] | 1000;
+    ultrasonicSensors[ultrasonicCount].active = us["active"] | true;
+    ultrasonicSensors[ultrasonicCount].readInterval = us["read_interval"] | 100;
+    ultrasonicSensors[ultrasonicCount].lastRead = 0;
+    ultrasonicSensors[ultrasonicCount].lastDistance = -1;
+    ultrasonicSensors[ultrasonicCount].triggered = false;
+    ultrasonicSensors[ultrasonicCount].triggerStartTime = 0;
+
+    // Configurar pines
+    pinMode(trigPin, OUTPUT);
+    pinMode(echoPin, INPUT);
+    digitalWrite(trigPin, LOW);
+
+    // Configurar GPIO de trigger si existe
+    if (ultrasonicSensors[ultrasonicCount].triggerGpioPin >= 0) {
+      pinMode(ultrasonicSensors[ultrasonicCount].triggerGpioPin, OUTPUT);
+      digitalWrite(ultrasonicSensors[ultrasonicCount].triggerGpioPin,
+                   !ultrasonicSensors[ultrasonicCount].triggerGpioValue); // Estado inicial opuesto
+    }
+
+    ultrasonicCount++;
+  }
+
+  Serial.print("Sensores ultrasónicos configurados: ");
+  Serial.println(ultrasonicCount);
+
   // Verificar OTA pendiente
   if (!doc["ota"].isNull()) {
     JsonObject ota = doc["ota"];
@@ -744,6 +823,64 @@ void handleCommand(JsonDocument& doc) {
 
     Serial.printf("Sensores DHT actualizados: %d\n", dhtCount);
   }
+  else if (strcmp(action, "update_ultrasonic") == 0) {
+    // Reconfigurar sensores ultrasónicos
+    Serial.println("📥 Recibida actualización de Ultrasonic");
+
+    JsonArray ultrasonicArray = doc["ultrasonic"].as<JsonArray>();
+    ultrasonicCount = 0;
+
+    for (JsonObject us : ultrasonicArray) {
+      if (ultrasonicCount >= MAX_ULTRASONIC_SENSORS) break;
+
+      int trigPin = us["trig_pin"];
+      int echoPin = us["echo_pin"];
+
+      ultrasonicSensors[ultrasonicCount].id = us["id"];
+      ultrasonicSensors[ultrasonicCount].trigPin = trigPin;
+      ultrasonicSensors[ultrasonicCount].echoPin = echoPin;
+      ultrasonicSensors[ultrasonicCount].name = us["name"].as<String>();
+      ultrasonicSensors[ultrasonicCount].maxDistance = us["max_distance"] | 400;
+      ultrasonicSensors[ultrasonicCount].detectionEnabled = us["detection_enabled"] | true;
+      ultrasonicSensors[ultrasonicCount].triggerDistance = us["trigger_distance"] | 50;
+      ultrasonicSensors[ultrasonicCount].triggerGpioPin = us["trigger_gpio_pin"] | -1;
+      ultrasonicSensors[ultrasonicCount].triggerGpioValue = us["trigger_gpio_value"] | 1;
+      ultrasonicSensors[ultrasonicCount].triggerDuration = us["trigger_duration"] | 1000;
+      ultrasonicSensors[ultrasonicCount].active = us["active"] | true;
+      ultrasonicSensors[ultrasonicCount].readInterval = us["read_interval"] | 100;
+      ultrasonicSensors[ultrasonicCount].lastRead = 0;
+      ultrasonicSensors[ultrasonicCount].lastDistance = -1;
+      ultrasonicSensors[ultrasonicCount].triggered = false;
+      ultrasonicSensors[ultrasonicCount].triggerStartTime = 0;
+
+      pinMode(trigPin, OUTPUT);
+      pinMode(echoPin, INPUT);
+      digitalWrite(trigPin, LOW);
+
+      if (ultrasonicSensors[ultrasonicCount].triggerGpioPin >= 0) {
+        pinMode(ultrasonicSensors[ultrasonicCount].triggerGpioPin, OUTPUT);
+        digitalWrite(ultrasonicSensors[ultrasonicCount].triggerGpioPin,
+                     !ultrasonicSensors[ultrasonicCount].triggerGpioValue);
+      }
+
+      ultrasonicCount++;
+    }
+
+    Serial.printf("Sensores ultrasónicos actualizados: %d\n", ultrasonicCount);
+  }
+  else if (strcmp(action, "ultrasonic_trigger") == 0) {
+    // Comando de trigger desde el backend
+    int gpioPin = doc["gpio_pin"];
+    int gpioValue = doc["gpio_value"];
+    int duration = doc["duration"] | 1000;
+
+    if (gpioPin >= 0) {
+      digitalWrite(gpioPin, gpioValue);
+      Serial.printf("🎯 Ultrasonic trigger: GPIO %d = %d\n", gpioPin, gpioValue);
+
+      // Si tiene duración, programar reset (el backend maneja la lógica)
+    }
+  }
   else if (strcmp(action, "reboot") == 0) {
     Serial.println("🔄 Reiniciando...");
     delay(1000);
@@ -823,6 +960,26 @@ void sendSensorData() {
     }
   }
 
+  // Agregar datos ultrasónicos
+  if (ultrasonicCount > 0) {
+    JsonArray ultrasonicArray = payload.createNestedArray("ultrasonic");
+    for (int i = 0; i < ultrasonicCount; i++) {
+      if (ultrasonicSensors[i].active && ultrasonicSensors[i].lastDistance >= 0) {
+        JsonObject u = ultrasonicArray.createNestedObject();
+        u["id"] = ultrasonicSensors[i].id;
+        u["trig_pin"] = ultrasonicSensors[i].trigPin;
+        u["echo_pin"] = ultrasonicSensors[i].echoPin;
+        u["name"] = ultrasonicSensors[i].name;
+        u["distance"] = ultrasonicSensors[i].lastDistance;
+        u["triggered"] = ultrasonicSensors[i].triggered;
+
+        Serial.printf("Ultrasonic[%d] trig:%d echo:%d dist:%.1f cm\n",
+          i, ultrasonicSensors[i].trigPin, ultrasonicSensors[i].echoPin,
+          ultrasonicSensors[i].lastDistance);
+      }
+    }
+  }
+
   String json;
   serializeJson(doc, json);
   webSocket.sendTXT(json);
@@ -865,6 +1022,109 @@ void processGpioLoops() {
       gpios[i].lastLoop = millis();
       gpios[i].value = !gpios[i].value;
       digitalWrite(gpios[i].pin, gpios[i].value);
+    }
+  }
+}
+
+// ============================================
+// SENSORES ULTRASÓNICOS HC-SR04
+// ============================================
+
+float readUltrasonic(int trigPin, int echoPin, int maxDistance) {
+  // Generar pulso de trigger
+  digitalWrite(trigPin, LOW);
+  delayMicroseconds(2);
+  digitalWrite(trigPin, HIGH);
+  delayMicroseconds(10);
+  digitalWrite(trigPin, LOW);
+
+  // Medir tiempo de respuesta con timeout
+  unsigned long timeout = maxDistance * 58 + 1000; // timeout en microsegundos
+  unsigned long duration = pulseIn(echoPin, HIGH, timeout);
+
+  if (duration == 0) {
+    return -1; // Sin respuesta (fuera de rango)
+  }
+
+  // Calcular distancia en cm
+  // Velocidad del sonido = 343 m/s = 0.0343 cm/µs
+  // Distancia = (tiempo * velocidad) / 2
+  float distance = duration * 0.0343 / 2.0;
+
+  // Limitar al rango máximo
+  if (distance > maxDistance) {
+    return maxDistance;
+  }
+
+  return distance;
+}
+
+void readUltrasonicSensors() {
+  for (int i = 0; i < ultrasonicCount; i++) {
+    if (!ultrasonicSensors[i].active) continue;
+
+    if (millis() - ultrasonicSensors[i].lastRead >= ultrasonicSensors[i].readInterval) {
+      ultrasonicSensors[i].lastRead = millis();
+
+      float distance = readUltrasonic(
+        ultrasonicSensors[i].trigPin,
+        ultrasonicSensors[i].echoPin,
+        ultrasonicSensors[i].maxDistance
+      );
+
+      ultrasonicSensors[i].lastDistance = distance;
+
+      // Verificar detección local (el backend hace análisis inteligente)
+      if (ultrasonicSensors[i].detectionEnabled && distance >= 0) {
+        bool objectDetected = distance <= ultrasonicSensors[i].triggerDistance;
+
+        if (objectDetected && !ultrasonicSensors[i].triggered) {
+          // Objeto detectado - activar trigger
+          ultrasonicSensors[i].triggered = true;
+          ultrasonicSensors[i].triggerStartTime = millis();
+
+          if (ultrasonicSensors[i].triggerGpioPin >= 0) {
+            digitalWrite(ultrasonicSensors[i].triggerGpioPin,
+                        ultrasonicSensors[i].triggerGpioValue);
+            Serial.printf("🎯 Objeto detectado a %.1f cm - GPIO %d activado\n",
+              distance, ultrasonicSensors[i].triggerGpioPin);
+          }
+        }
+        else if (!objectDetected && ultrasonicSensors[i].triggered) {
+          // Objeto salió del rango
+          // Si triggerDuration es 0, mantener GPIO activo
+          // Si no, el processUltrasonicTriggers se encargará del timeout
+          if (ultrasonicSensors[i].triggerDuration == 0) {
+            // Mantener hasta que salga del rango
+            ultrasonicSensors[i].triggered = false;
+            if (ultrasonicSensors[i].triggerGpioPin >= 0) {
+              digitalWrite(ultrasonicSensors[i].triggerGpioPin,
+                          !ultrasonicSensors[i].triggerGpioValue);
+              Serial.printf("📤 Objeto salió del rango - GPIO %d desactivado\n",
+                ultrasonicSensors[i].triggerGpioPin);
+            }
+          }
+        }
+      }
+    }
+  }
+}
+
+void processUltrasonicTriggers() {
+  for (int i = 0; i < ultrasonicCount; i++) {
+    if (!ultrasonicSensors[i].triggered) continue;
+    if (ultrasonicSensors[i].triggerDuration == 0) continue; // Mantener indefinidamente
+
+    // Verificar timeout del trigger
+    if (millis() - ultrasonicSensors[i].triggerStartTime >= ultrasonicSensors[i].triggerDuration) {
+      ultrasonicSensors[i].triggered = false;
+
+      if (ultrasonicSensors[i].triggerGpioPin >= 0) {
+        digitalWrite(ultrasonicSensors[i].triggerGpioPin,
+                    !ultrasonicSensors[i].triggerGpioValue);
+        Serial.printf("⏱️ Trigger timeout - GPIO %d desactivado\n",
+          ultrasonicSensors[i].triggerGpioPin);
+      }
     }
   }
 }
