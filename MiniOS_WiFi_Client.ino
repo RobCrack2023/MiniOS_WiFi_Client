@@ -122,9 +122,19 @@ struct UltrasonicConfig {
   bool triggered;
   unsigned long triggerStartTime;
   // Buffer para detección de movimiento
-  float distanceBuffer[5];  // Últimas 5 lecturas
+  float distanceBuffer[10];  // Últimas 10 lecturas para mejor análisis
   int bufferIndex;
   bool bufferFull;
+  // Detección inteligente de animales (local)
+  bool smartDetectionEnabled;
+  String targetAnimal;       // "any", "mouse", "cat", "both"
+  float mouseMaxSpeed;       // cm/s - velocidad máxima para ratón
+  int mouseMaxDuration;      // ms - duración máxima para ratón
+  int catMinDuration;        // ms - duración mínima para gato
+  // Estado de detección actual
+  unsigned long detectionStartTime;
+  String detectedAnimal;
+  float currentSpeed;
 };
 
 // ============================================
@@ -194,6 +204,8 @@ void readUltrasonicSensors();
 void processUltrasonicTriggers();
 float calculateMovementSpeed(int sensorIndex);
 bool isObjectMoving(int sensorIndex);
+String classifyAnimal(int sensorIndex);
+bool shouldTriggerForAnimal(int sensorIndex, String detectedAnimal);
 
 // LED RGB
 void blinkRGB(uint8_t r, uint8_t g, uint8_t b, int duration = 50);
@@ -670,12 +682,28 @@ void handleConfig(JsonDocument& doc) {
     ultrasonicSensors[ultrasonicCount].lastDistance = -1;
     ultrasonicSensors[ultrasonicCount].triggered = false;
     ultrasonicSensors[ultrasonicCount].triggerStartTime = 0;
+
     // Inicializar buffer de movimiento
     ultrasonicSensors[ultrasonicCount].bufferIndex = 0;
     ultrasonicSensors[ultrasonicCount].bufferFull = false;
-    for (int j = 0; j < 5; j++) {
+    for (int j = 0; j < 10; j++) {
       ultrasonicSensors[ultrasonicCount].distanceBuffer[j] = -1;
     }
+
+    // Parámetros de detección inteligente (desde backend)
+    ultrasonicSensors[ultrasonicCount].smartDetectionEnabled = us["smart_detection_enabled"] | false;
+    ultrasonicSensors[ultrasonicCount].targetAnimal = us["animal_type"].as<String>();
+    if (ultrasonicSensors[ultrasonicCount].targetAnimal.length() == 0) {
+      ultrasonicSensors[ultrasonicCount].targetAnimal = "any";
+    }
+    ultrasonicSensors[ultrasonicCount].mouseMaxSpeed = us["mouse_max_speed"] | 100.0;
+    ultrasonicSensors[ultrasonicCount].mouseMaxDuration = us["mouse_max_duration"] | 2000;
+    ultrasonicSensors[ultrasonicCount].catMinDuration = us["cat_min_duration"] | 2000;
+
+    // Estado de detección
+    ultrasonicSensors[ultrasonicCount].detectionStartTime = 0;
+    ultrasonicSensors[ultrasonicCount].detectedAnimal = "";
+    ultrasonicSensors[ultrasonicCount].currentSpeed = 0;
 
     // Configurar pines
     pinMode(trigPin, OUTPUT);
@@ -864,12 +892,28 @@ void handleCommand(JsonDocument& doc) {
       ultrasonicSensors[ultrasonicCount].lastDistance = -1;
       ultrasonicSensors[ultrasonicCount].triggered = false;
       ultrasonicSensors[ultrasonicCount].triggerStartTime = 0;
+
       // Inicializar buffer de movimiento
       ultrasonicSensors[ultrasonicCount].bufferIndex = 0;
       ultrasonicSensors[ultrasonicCount].bufferFull = false;
-      for (int j = 0; j < 5; j++) {
+      for (int j = 0; j < 10; j++) {
         ultrasonicSensors[ultrasonicCount].distanceBuffer[j] = -1;
       }
+
+      // Parámetros de detección inteligente
+      ultrasonicSensors[ultrasonicCount].smartDetectionEnabled = us["smart_detection_enabled"] | false;
+      ultrasonicSensors[ultrasonicCount].targetAnimal = us["animal_type"].as<String>();
+      if (ultrasonicSensors[ultrasonicCount].targetAnimal.length() == 0) {
+        ultrasonicSensors[ultrasonicCount].targetAnimal = "any";
+      }
+      ultrasonicSensors[ultrasonicCount].mouseMaxSpeed = us["mouse_max_speed"] | 100.0;
+      ultrasonicSensors[ultrasonicCount].mouseMaxDuration = us["mouse_max_duration"] | 2000;
+      ultrasonicSensors[ultrasonicCount].catMinDuration = us["cat_min_duration"] | 2000;
+
+      // Estado de detección
+      ultrasonicSensors[ultrasonicCount].detectionStartTime = 0;
+      ultrasonicSensors[ultrasonicCount].detectedAnimal = "";
+      ultrasonicSensors[ultrasonicCount].currentSpeed = 0;
 
       pinMode(trigPin, OUTPUT);
       pinMode(echoPin, INPUT);
@@ -885,19 +929,6 @@ void handleCommand(JsonDocument& doc) {
     }
 
     Serial.printf("Sensores ultrasónicos actualizados: %d\n", ultrasonicCount);
-  }
-  else if (strcmp(action, "ultrasonic_trigger") == 0) {
-    // Comando de trigger desde el backend
-    int gpioPin = doc["gpio_pin"];
-    int gpioValue = doc["gpio_value"];
-    int duration = doc["duration"] | 1000;
-
-    if (gpioPin >= 0) {
-      digitalWrite(gpioPin, gpioValue);
-      Serial.printf("🎯 Ultrasonic trigger: GPIO %d = %d\n", gpioPin, gpioValue);
-
-      // Si tiene duración, programar reset (el backend maneja la lógica)
-    }
   }
   else if (strcmp(action, "reboot") == 0) {
     Serial.println("🔄 Reiniciando...");
@@ -978,7 +1009,7 @@ void sendSensorData() {
     }
   }
 
-  // Agregar datos ultrasónicos
+  // Agregar datos ultrasónicos con análisis LOCAL
   if (ultrasonicCount > 0) {
     JsonArray ultrasonicArray = payload.createNestedArray("ultrasonic");
     for (int i = 0; i < ultrasonicCount; i++) {
@@ -991,9 +1022,30 @@ void sendSensorData() {
         u["distance"] = ultrasonicSensors[i].lastDistance;
         u["triggered"] = ultrasonicSensors[i].triggered;
 
-        Serial.printf("Ultrasonic[%d] trig:%d echo:%d dist:%.1f cm\n",
-          i, ultrasonicSensors[i].trigPin, ultrasonicSensors[i].echoPin,
-          ultrasonicSensors[i].lastDistance);
+        // Incluir análisis de detección LOCAL (calculado en ESP32)
+        JsonObject analysis = u.createNestedObject("analysis");
+        bool isMoving = isObjectMoving(i);
+        bool inRange = ultrasonicSensors[i].lastDistance <= ultrasonicSensors[i].triggerDistance;
+
+        analysis["detected"] = isMoving && inRange;
+        analysis["speed"] = (int)ultrasonicSensors[i].currentSpeed;
+        analysis["isMoving"] = isMoving;
+
+        if (ultrasonicSensors[i].detectedAnimal.length() > 0) {
+          analysis["animalType"] = ultrasonicSensors[i].detectedAnimal;
+        } else {
+          analysis["animalType"] = "none";
+        }
+
+        if (ultrasonicSensors[i].detectionStartTime > 0) {
+          analysis["duration"] = (int)(millis() - ultrasonicSensors[i].detectionStartTime);
+        } else {
+          analysis["duration"] = 0;
+        }
+
+        Serial.printf("Ultrasonic[%d] dist:%.1f cm vel:%.1f cm/s animal:%s\n",
+          i, ultrasonicSensors[i].lastDistance, ultrasonicSensors[i].currentSpeed,
+          ultrasonicSensors[i].detectedAnimal.c_str());
       }
     }
   }
@@ -1082,24 +1134,28 @@ float readUltrasonic(int trigPin, int echoPin, int maxDistance) {
 float calculateMovementSpeed(int sensorIndex) {
   UltrasonicConfig& sensor = ultrasonicSensors[sensorIndex];
 
-  if (!sensor.bufferFull && sensor.bufferIndex < 2) {
+  if (!sensor.bufferFull && sensor.bufferIndex < 3) {
     return 0; // No hay suficientes lecturas
   }
 
   float totalChange = 0;
-  int count = sensor.bufferFull ? 5 : sensor.bufferIndex;
+  int count = sensor.bufferFull ? 10 : sensor.bufferIndex;
+  int validReadings = 0;
 
   for (int i = 1; i < count; i++) {
-    int prevIdx = (sensor.bufferIndex - count + i + 5) % 5;
-    int currIdx = (sensor.bufferIndex - count + i + 1 + 5) % 5;
+    int prevIdx = (sensor.bufferIndex - count + i + 10) % 10;
+    int currIdx = (sensor.bufferIndex - count + i + 1 + 10) % 10;
 
     if (sensor.distanceBuffer[prevIdx] >= 0 && sensor.distanceBuffer[currIdx] >= 0) {
       totalChange += abs(sensor.distanceBuffer[currIdx] - sensor.distanceBuffer[prevIdx]);
+      validReadings++;
     }
   }
 
-  // Tiempo entre lecturas (count-1 intervalos)
-  float timeSpan = (count - 1) * sensor.readInterval / 1000.0; // segundos
+  if (validReadings == 0) return 0;
+
+  // Tiempo entre lecturas
+  float timeSpan = validReadings * sensor.readInterval / 1000.0; // segundos
 
   return timeSpan > 0 ? totalChange / timeSpan : 0; // cm/s
 }
@@ -1110,6 +1166,66 @@ bool isObjectMoving(int sensorIndex) {
   const float MIN_MOVEMENT_SPEED = 5.0; // cm/s
   float speed = calculateMovementSpeed(sensorIndex);
   return speed >= MIN_MOVEMENT_SPEED;
+}
+
+// Clasifica el tipo de animal basado en velocidad y duración
+// Toda la lógica se ejecuta LOCALMENTE en el ESP32
+String classifyAnimal(int sensorIndex) {
+  UltrasonicConfig& sensor = ultrasonicSensors[sensorIndex];
+
+  if (!sensor.smartDetectionEnabled) {
+    return "unknown";
+  }
+
+  float speed = sensor.currentSpeed;
+  unsigned long duration = millis() - sensor.detectionStartTime;
+
+  // Ratón: movimiento rápido y/o duración corta
+  // Los ratones pasan rápido y no se quedan mucho tiempo
+  if (speed <= sensor.mouseMaxSpeed && duration <= sensor.mouseMaxDuration) {
+    return "mouse";
+  }
+
+  // Gato/Perro: permanece más tiempo en el área
+  // Son más lentos y curiosos
+  if (duration >= sensor.catMinDuration) {
+    return "cat";
+  }
+
+  // Aún clasificando (no hay suficientes datos)
+  return "detecting";
+}
+
+// Determina si debe activar el GPIO según el animal detectado y configuración
+bool shouldTriggerForAnimal(int sensorIndex, String detectedAnimal) {
+  UltrasonicConfig& sensor = ultrasonicSensors[sensorIndex];
+
+  // Si detección inteligente está deshabilitada, activar con cualquier movimiento
+  if (!sensor.smartDetectionEnabled) {
+    return true;
+  }
+
+  // No activar si aún está clasificando
+  if (detectedAnimal == "detecting" || detectedAnimal == "unknown") {
+    return false;
+  }
+
+  String target = sensor.targetAnimal;
+
+  if (target == "any") {
+    return detectedAnimal == "cat" || detectedAnimal == "mouse";
+  }
+  if (target == "both") {
+    return detectedAnimal == "cat" || detectedAnimal == "mouse";
+  }
+  if (target == "mouse") {
+    return detectedAnimal == "mouse";
+  }
+  if (target == "cat") {
+    return detectedAnimal == "cat";
+  }
+
+  return false;
 }
 
 void readUltrasonicSensors() {
@@ -1130,51 +1246,84 @@ void readUltrasonicSensors() {
       // Agregar lectura al buffer de movimiento
       if (distance >= 0) {
         ultrasonicSensors[i].distanceBuffer[ultrasonicSensors[i].bufferIndex] = distance;
-        ultrasonicSensors[i].bufferIndex = (ultrasonicSensors[i].bufferIndex + 1) % 5;
+        ultrasonicSensors[i].bufferIndex = (ultrasonicSensors[i].bufferIndex + 1) % 10;
         if (ultrasonicSensors[i].bufferIndex == 0) {
           ultrasonicSensors[i].bufferFull = true;
         }
       }
 
-      // Verificar detección local con filtro de movimiento
+      // Verificar detección con lógica inteligente LOCAL
       if (ultrasonicSensors[i].detectionEnabled && distance >= 0) {
         bool objectInRange = distance <= ultrasonicSensors[i].triggerDistance;
         bool objectMoving = isObjectMoving(i);
 
-        if (objectInRange && objectMoving && !ultrasonicSensors[i].triggered) {
-          // Objeto EN MOVIMIENTO detectado - activar trigger
-          ultrasonicSensors[i].triggered = true;
-          ultrasonicSensors[i].triggerStartTime = millis();
+        // Calcular velocidad actual
+        ultrasonicSensors[i].currentSpeed = calculateMovementSpeed(i);
 
-          if (ultrasonicSensors[i].triggerGpioPin >= 0) {
-            digitalWrite(ultrasonicSensors[i].triggerGpioPin,
-                        ultrasonicSensors[i].triggerGpioValue);
-            float speed = calculateMovementSpeed(i);
-            Serial.printf("🎯 Movimiento detectado a %.1f cm (vel: %.1f cm/s) - GPIO %d activado\n",
-              distance, speed, ultrasonicSensors[i].triggerGpioPin);
+        if (objectInRange && objectMoving) {
+          // Objeto en movimiento detectado
+
+          // Iniciar timer de detección si es nuevo
+          if (ultrasonicSensors[i].detectionStartTime == 0) {
+            ultrasonicSensors[i].detectionStartTime = millis();
+            Serial.printf("🔍 Objeto en movimiento detectado a %.1f cm\n", distance);
           }
-        }
-        else if (!objectInRange && ultrasonicSensors[i].triggered) {
-          // Objeto salió del rango
-          if (ultrasonicSensors[i].triggerDuration == 0) {
-            // Mantener hasta que salga del rango
-            ultrasonicSensors[i].triggered = false;
+
+          // Clasificar animal (lógica LOCAL)
+          String animal = classifyAnimal(i);
+          ultrasonicSensors[i].detectedAnimal = animal;
+
+          // Verificar si debe activar trigger
+          if (!ultrasonicSensors[i].triggered && shouldTriggerForAnimal(i, animal)) {
+            ultrasonicSensors[i].triggered = true;
+            ultrasonicSensors[i].triggerStartTime = millis();
+
             if (ultrasonicSensors[i].triggerGpioPin >= 0) {
               digitalWrite(ultrasonicSensors[i].triggerGpioPin,
-                          !ultrasonicSensors[i].triggerGpioValue);
-              Serial.printf("📤 Objeto salió del rango - GPIO %d desactivado\n",
-                ultrasonicSensors[i].triggerGpioPin);
+                          ultrasonicSensors[i].triggerGpioValue);
+
+              if (ultrasonicSensors[i].smartDetectionEnabled) {
+                Serial.printf("🎯 %s detectado a %.1f cm (vel: %.1f cm/s) - GPIO %d activado\n",
+                  animal.c_str(), distance, ultrasonicSensors[i].currentSpeed,
+                  ultrasonicSensors[i].triggerGpioPin);
+              } else {
+                Serial.printf("🎯 Movimiento detectado a %.1f cm (vel: %.1f cm/s) - GPIO %d activado\n",
+                  distance, ultrasonicSensors[i].currentSpeed,
+                  ultrasonicSensors[i].triggerGpioPin);
+              }
             }
           }
         }
-        else if (objectInRange && !objectMoving && ultrasonicSensors[i].triggered) {
-          // Objeto está en rango pero dejó de moverse - desactivar
-          if (ultrasonicSensors[i].triggerDuration == 0) {
+        else if (!objectInRange) {
+          // Objeto salió del rango - resetear detección
+          if (ultrasonicSensors[i].detectionStartTime > 0) {
+            unsigned long duration = millis() - ultrasonicSensors[i].detectionStartTime;
+            Serial.printf("📤 Objeto salió del rango (duración: %lu ms)\n", duration);
+          }
+
+          ultrasonicSensors[i].detectionStartTime = 0;
+          ultrasonicSensors[i].detectedAnimal = "";
+
+          if (ultrasonicSensors[i].triggered && ultrasonicSensors[i].triggerDuration == 0) {
             ultrasonicSensors[i].triggered = false;
             if (ultrasonicSensors[i].triggerGpioPin >= 0) {
               digitalWrite(ultrasonicSensors[i].triggerGpioPin,
                           !ultrasonicSensors[i].triggerGpioValue);
-              Serial.printf("⏹️ Objeto estático detectado - GPIO %d desactivado\n",
+              Serial.printf("📤 GPIO %d desactivado\n", ultrasonicSensors[i].triggerGpioPin);
+            }
+          }
+        }
+        else if (objectInRange && !objectMoving) {
+          // Objeto en rango pero estático - resetear si no hay trigger activo con duración
+          if (ultrasonicSensors[i].triggered && ultrasonicSensors[i].triggerDuration == 0) {
+            ultrasonicSensors[i].triggered = false;
+            ultrasonicSensors[i].detectionStartTime = 0;
+            ultrasonicSensors[i].detectedAnimal = "";
+
+            if (ultrasonicSensors[i].triggerGpioPin >= 0) {
+              digitalWrite(ultrasonicSensors[i].triggerGpioPin,
+                          !ultrasonicSensors[i].triggerGpioValue);
+              Serial.printf("⏹️ Objeto estático - GPIO %d desactivado\n",
                 ultrasonicSensors[i].triggerGpioPin);
             }
           }
