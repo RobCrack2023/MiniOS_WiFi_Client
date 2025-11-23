@@ -19,6 +19,7 @@
 #include <Preferences.h>
 #include <DHT.h>
 #include <Adafruit_NeoPixel.h>
+#include <LittleFS.h>
 
 // ============================================
 // CONFIGURACIÓN
@@ -38,6 +39,10 @@ int BACKEND_PORT = 443;  // Puerto 80 con Nginx, 443 con SSL
 #define MAX_GPIOS 20
 #define MAX_DHT_SENSORS 4
 #define MAX_ULTRASONIC_SENSORS 4
+
+// Almacenamiento offline de detecciones
+#define DETECTIONS_FILE "/detections.json"
+#define MAX_OFFLINE_DETECTIONS 100  // Máximo de detecciones a guardar offline
 #define LED_STATUS 2  // LED integrado
 #define LED_RGB_PIN 48  // LED RGB NeoPixel integrado ESP32-S3
 #define LED_RGB_COUNT 1
@@ -171,6 +176,10 @@ String otaFilename = "";
 int otaFilesize = 0;
 String otaChecksum = "";
 
+// Almacenamiento offline
+bool littleFsReady = false;
+int pendingDetections = 0;
+
 // ============================================
 // PROTOTIPOS DE FUNCIONES
 // ============================================
@@ -207,6 +216,12 @@ bool isObjectMoving(int sensorIndex);
 String classifyAnimal(int sensorIndex);
 bool shouldTriggerForAnimal(int sensorIndex, String detectedAnimal);
 
+// Almacenamiento offline
+void initLittleFS();
+void saveOfflineDetection(String animalType, float distance, float speed, unsigned long duration);
+void sendPendingDetections();
+int countPendingDetections();
+
 // LED RGB
 void blinkRGB(uint8_t r, uint8_t g, uint8_t b, int duration = 50);
 
@@ -231,6 +246,9 @@ void setup() {
   rgbLed.setBrightness(50);  // Brillo moderado (0-255)
   rgbLed.clear();
   rgbLed.show();
+
+  // Inicializar almacenamiento Flash (LittleFS)
+  initLittleFS();
 
   // Inicializar WiFi para obtener MAC
   WiFi.mode(WIFI_STA);
@@ -549,6 +567,12 @@ void handleConfig(JsonDocument& doc) {
 
   Serial.print("✅ Registrado como dispositivo ID: ");
   Serial.println(deviceId);
+
+  // Enviar detecciones pendientes offline
+  if (pendingDetections > 0) {
+    Serial.printf("📤 Hay %d detecciones offline pendientes\n", pendingDetections);
+    sendPendingDetections();
+  }
 
   // Configurar GPIOs
   JsonArray gpioArray = doc["gpio"].as<JsonArray>();
@@ -1302,6 +1326,12 @@ void readUltrasonicSensors() {
                   ultrasonicSensors[i].triggerGpioPin);
               }
             }
+
+            // Guardar detección offline si no hay conexión WiFi
+            if (WiFi.status() != WL_CONNECTED || !isRegistered) {
+              unsigned long dur = millis() - ultrasonicSensors[i].detectionStartTime;
+              saveOfflineDetection(animal, distance, ultrasonicSensors[i].currentSpeed, dur);
+            }
           }
         }
         else if (!objectInRange) {
@@ -1359,6 +1389,119 @@ void processUltrasonicTriggers() {
           ultrasonicSensors[i].triggerGpioPin);
       }
     }
+  }
+}
+
+// ============================================
+// ALMACENAMIENTO OFFLINE (LittleFS)
+// ============================================
+
+void initLittleFS() {
+  Serial.print("💾 Inicializando LittleFS... ");
+
+  if (LittleFS.begin(true)) {  // true = formatear si falla
+    littleFsReady = true;
+    pendingDetections = countPendingDetections();
+    Serial.printf("OK! (%d detecciones pendientes)\n", pendingDetections);
+  } else {
+    littleFsReady = false;
+    Serial.println("ERROR!");
+  }
+}
+
+int countPendingDetections() {
+  if (!littleFsReady) return 0;
+
+  File file = LittleFS.open(DETECTIONS_FILE, "r");
+  if (!file) return 0;
+
+  int count = 0;
+  while (file.available()) {
+    String line = file.readStringUntil('\n');
+    if (line.length() > 5) count++;  // Línea válida
+  }
+  file.close();
+  return count;
+}
+
+void saveOfflineDetection(String animalType, float distance, float speed, unsigned long duration) {
+  if (!littleFsReady) {
+    Serial.println("⚠️ LittleFS no disponible, detección no guardada");
+    return;
+  }
+
+  // Verificar límite de detecciones
+  if (pendingDetections >= MAX_OFFLINE_DETECTIONS) {
+    Serial.println("⚠️ Límite de detecciones offline alcanzado");
+    return;
+  }
+
+  // Crear JSON de la detección
+  StaticJsonDocument<256> doc;
+  doc["ts"] = millis();  // Timestamp relativo (se ajustará al enviar)
+  doc["animal"] = animalType;
+  doc["dist"] = (int)distance;
+  doc["speed"] = (int)speed;
+  doc["dur"] = (int)duration;
+
+  // Guardar en archivo (append)
+  File file = LittleFS.open(DETECTIONS_FILE, "a");
+  if (file) {
+    String json;
+    serializeJson(doc, json);
+    file.println(json);
+    file.close();
+    pendingDetections++;
+    Serial.printf("💾 Detección guardada offline (%d pendientes)\n", pendingDetections);
+    blinkRGB(255, 165, 0);  // Naranja: guardado offline
+  } else {
+    Serial.println("❌ Error al guardar detección");
+  }
+}
+
+void sendPendingDetections() {
+  if (!littleFsReady || pendingDetections == 0) return;
+  if (!isRegistered) return;
+
+  Serial.printf("📤 Enviando %d detecciones pendientes...\n", pendingDetections);
+
+  File file = LittleFS.open(DETECTIONS_FILE, "r");
+  if (!file) return;
+
+  // Crear mensaje con detecciones pendientes
+  StaticJsonDocument<4096> doc;
+  doc["type"] = "offline_detections";
+  doc["mac_address"] = deviceMac;
+  JsonArray detections = doc.createNestedArray("detections");
+
+  int sent = 0;
+  while (file.available() && sent < 50) {  // Enviar máximo 50 por vez
+    String line = file.readStringUntil('\n');
+    if (line.length() < 5) continue;
+
+    StaticJsonDocument<256> det;
+    if (deserializeJson(det, line) == DeserializationError::Ok) {
+      JsonObject obj = detections.createNestedObject();
+      obj["animal"] = det["animal"].as<String>();
+      obj["distance"] = det["dist"].as<int>();
+      obj["speed"] = det["speed"].as<int>();
+      obj["duration"] = det["dur"].as<int>();
+      obj["offline_ts"] = det["ts"].as<unsigned long>();
+      sent++;
+    }
+  }
+  file.close();
+
+  if (sent > 0) {
+    String json;
+    serializeJson(doc, json);
+    webSocket.sendTXT(json);
+    Serial.printf("✅ Enviadas %d detecciones offline\n", sent);
+    blinkRGB(0, 255, 0);  // Verde: enviado
+
+    // Limpiar archivo después de enviar
+    LittleFS.remove(DETECTIONS_FILE);
+    pendingDetections = 0;
   }
 }
 
