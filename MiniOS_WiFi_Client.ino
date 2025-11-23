@@ -1061,14 +1061,18 @@ void sendSensorData() {
         bool isMoving = isObjectMoving(i);
         bool inRange = ultrasonicSensors[i].lastDistance <= ultrasonicSensors[i].triggerDistance;
 
-        analysis["detected"] = isMoving && inRange;
+        // detected = true si GPIO está activo O hay movimiento actual en rango
+        analysis["detected"] = ultrasonicSensors[i].triggered || (isMoving && inRange);
         analysis["speed"] = (int)ultrasonicSensors[i].currentSpeed;
         analysis["isMoving"] = isMoving;
 
-        if (ultrasonicSensors[i].detectedAnimal.length() > 0) {
+        // Mostrar el tipo de animal detectado mientras GPIO esté activo
+        if (ultrasonicSensors[i].triggered && ultrasonicSensors[i].detectedAnimal.length() > 0) {
+          analysis["animalType"] = ultrasonicSensors[i].detectedAnimal;
+        } else if (ultrasonicSensors[i].detectedAnimal.length() > 0) {
           analysis["animalType"] = ultrasonicSensors[i].detectedAnimal;
         } else {
-          analysis["animalType"] = "none";
+          analysis["animalType"] = inRange ? "detecting" : "none";
         }
 
         if (ultrasonicSensors[i].detectionStartTime > 0) {
@@ -1354,19 +1358,10 @@ void readUltrasonicSensors() {
           }
         }
         else if (objectInRange && !objectMoving) {
-          // Objeto en rango pero estático - resetear si no hay trigger activo con duración
-          if (ultrasonicSensors[i].triggered && ultrasonicSensors[i].triggerDuration == 0) {
-            ultrasonicSensors[i].triggered = false;
-            ultrasonicSensors[i].detectionStartTime = 0;
-            ultrasonicSensors[i].detectedAnimal = "";
-
-            if (ultrasonicSensors[i].triggerGpioPin >= 0) {
-              digitalWrite(ultrasonicSensors[i].triggerGpioPin,
-                          !ultrasonicSensors[i].triggerGpioValue);
-              Serial.printf("⏹️ Objeto estático - GPIO %d desactivado\n",
-                ultrasonicSensors[i].triggerGpioPin);
-            }
-          }
+          // Objeto en rango pero estático
+          // NO resetear mientras GPIO esté activo - el objeto sigue ahí
+          // Solo actualizar velocidad a 0
+          ultrasonicSensors[i].currentSpeed = 0;
         }
       }
     }
