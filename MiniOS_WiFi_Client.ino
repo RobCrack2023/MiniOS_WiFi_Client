@@ -274,31 +274,41 @@ void loop() {
   // Procesar comandos Serial
   handleSerial();
 
-  // WebSocket loop
-  webSocket.loop();
-
-  // Verificar conexión WiFi
-  if (WiFi.status() != WL_CONNECTED) {
-    if (millis() - lastReconnect > RECONNECT_INTERVAL) {
-      lastReconnect = millis();
-      connectWiFi();
-    }
-    return;
-  }
+  // =============================================
+  // SENSORES Y DETECCIÓN (SIEMPRE FUNCIONAN)
+  // Funcionan independientemente del estado WiFi
+  // =============================================
 
   // Leer sensores DHT
   readDHTSensors();
 
-  // Leer sensores ultrasónicos
+  // Leer sensores ultrasónicos y detectar animales
   readUltrasonicSensors();
 
-  // Procesar triggers de ultrasónicos
+  // Procesar triggers de ultrasónicos (activar GPIOs)
   processUltrasonicTriggers();
 
   // Procesar loops GPIO
   processGpioLoops();
 
-  // Enviar datos periódicamente
+  // =============================================
+  // CONECTIVIDAD (SOLO SI HAY WIFI)
+  // =============================================
+
+  // Verificar conexión WiFi
+  if (WiFi.status() != WL_CONNECTED) {
+    if (millis() - lastReconnect > RECONNECT_INTERVAL) {
+      lastReconnect = millis();
+      Serial.println("📡 Intentando reconectar WiFi...");
+      connectWiFi();
+    }
+    return; // Solo salta la parte de envío de datos
+  }
+
+  // WebSocket loop (mantener conexión)
+  webSocket.loop();
+
+  // Enviar datos periódicamente (solo si está registrado)
   if (isRegistered && millis() - lastDataSend > DATA_SEND_INTERVAL) {
     lastDataSend = millis();
     sendSensorData();
