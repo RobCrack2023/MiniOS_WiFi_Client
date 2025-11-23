@@ -121,6 +121,10 @@ struct UltrasonicConfig {
   float lastDistance;
   bool triggered;
   unsigned long triggerStartTime;
+  // Buffer para detección de movimiento
+  float distanceBuffer[5];  // Últimas 5 lecturas
+  int bufferIndex;
+  bool bufferFull;
 };
 
 // ============================================
@@ -188,6 +192,8 @@ float applyFormula(int rawValue, GPIOConfig& gpio);
 float readUltrasonic(int trigPin, int echoPin, int maxDistance);
 void readUltrasonicSensors();
 void processUltrasonicTriggers();
+float calculateMovementSpeed(int sensorIndex);
+bool isObjectMoving(int sensorIndex);
 
 // LED RGB
 void blinkRGB(uint8_t r, uint8_t g, uint8_t b, int duration = 50);
@@ -664,6 +670,12 @@ void handleConfig(JsonDocument& doc) {
     ultrasonicSensors[ultrasonicCount].lastDistance = -1;
     ultrasonicSensors[ultrasonicCount].triggered = false;
     ultrasonicSensors[ultrasonicCount].triggerStartTime = 0;
+    // Inicializar buffer de movimiento
+    ultrasonicSensors[ultrasonicCount].bufferIndex = 0;
+    ultrasonicSensors[ultrasonicCount].bufferFull = false;
+    for (int j = 0; j < 5; j++) {
+      ultrasonicSensors[ultrasonicCount].distanceBuffer[j] = -1;
+    }
 
     // Configurar pines
     pinMode(trigPin, OUTPUT);
@@ -852,6 +864,12 @@ void handleCommand(JsonDocument& doc) {
       ultrasonicSensors[ultrasonicCount].lastDistance = -1;
       ultrasonicSensors[ultrasonicCount].triggered = false;
       ultrasonicSensors[ultrasonicCount].triggerStartTime = 0;
+      // Inicializar buffer de movimiento
+      ultrasonicSensors[ultrasonicCount].bufferIndex = 0;
+      ultrasonicSensors[ultrasonicCount].bufferFull = false;
+      for (int j = 0; j < 5; j++) {
+        ultrasonicSensors[ultrasonicCount].distanceBuffer[j] = -1;
+      }
 
       pinMode(trigPin, OUTPUT);
       pinMode(echoPin, INPUT);
@@ -1059,6 +1077,41 @@ float readUltrasonic(int trigPin, int echoPin, int maxDistance) {
   return distance;
 }
 
+// Calcula la velocidad de movimiento basada en el buffer de lecturas
+// Retorna velocidad en cm/s (cambio de distancia por tiempo)
+float calculateMovementSpeed(int sensorIndex) {
+  UltrasonicConfig& sensor = ultrasonicSensors[sensorIndex];
+
+  if (!sensor.bufferFull && sensor.bufferIndex < 2) {
+    return 0; // No hay suficientes lecturas
+  }
+
+  float totalChange = 0;
+  int count = sensor.bufferFull ? 5 : sensor.bufferIndex;
+
+  for (int i = 1; i < count; i++) {
+    int prevIdx = (sensor.bufferIndex - count + i + 5) % 5;
+    int currIdx = (sensor.bufferIndex - count + i + 1 + 5) % 5;
+
+    if (sensor.distanceBuffer[prevIdx] >= 0 && sensor.distanceBuffer[currIdx] >= 0) {
+      totalChange += abs(sensor.distanceBuffer[currIdx] - sensor.distanceBuffer[prevIdx]);
+    }
+  }
+
+  // Tiempo entre lecturas (count-1 intervalos)
+  float timeSpan = (count - 1) * sensor.readInterval / 1000.0; // segundos
+
+  return timeSpan > 0 ? totalChange / timeSpan : 0; // cm/s
+}
+
+// Verifica si hay movimiento real (no objeto estático)
+// Umbral mínimo: 5 cm/s
+bool isObjectMoving(int sensorIndex) {
+  const float MIN_MOVEMENT_SPEED = 5.0; // cm/s
+  float speed = calculateMovementSpeed(sensorIndex);
+  return speed >= MIN_MOVEMENT_SPEED;
+}
+
 void readUltrasonicSensors() {
   for (int i = 0; i < ultrasonicCount; i++) {
     if (!ultrasonicSensors[i].active) continue;
@@ -1074,26 +1127,35 @@ void readUltrasonicSensors() {
 
       ultrasonicSensors[i].lastDistance = distance;
 
-      // Verificar detección local (el backend hace análisis inteligente)
-      if (ultrasonicSensors[i].detectionEnabled && distance >= 0) {
-        bool objectDetected = distance <= ultrasonicSensors[i].triggerDistance;
+      // Agregar lectura al buffer de movimiento
+      if (distance >= 0) {
+        ultrasonicSensors[i].distanceBuffer[ultrasonicSensors[i].bufferIndex] = distance;
+        ultrasonicSensors[i].bufferIndex = (ultrasonicSensors[i].bufferIndex + 1) % 5;
+        if (ultrasonicSensors[i].bufferIndex == 0) {
+          ultrasonicSensors[i].bufferFull = true;
+        }
+      }
 
-        if (objectDetected && !ultrasonicSensors[i].triggered) {
-          // Objeto detectado - activar trigger
+      // Verificar detección local con filtro de movimiento
+      if (ultrasonicSensors[i].detectionEnabled && distance >= 0) {
+        bool objectInRange = distance <= ultrasonicSensors[i].triggerDistance;
+        bool objectMoving = isObjectMoving(i);
+
+        if (objectInRange && objectMoving && !ultrasonicSensors[i].triggered) {
+          // Objeto EN MOVIMIENTO detectado - activar trigger
           ultrasonicSensors[i].triggered = true;
           ultrasonicSensors[i].triggerStartTime = millis();
 
           if (ultrasonicSensors[i].triggerGpioPin >= 0) {
             digitalWrite(ultrasonicSensors[i].triggerGpioPin,
                         ultrasonicSensors[i].triggerGpioValue);
-            Serial.printf("🎯 Objeto detectado a %.1f cm - GPIO %d activado\n",
-              distance, ultrasonicSensors[i].triggerGpioPin);
+            float speed = calculateMovementSpeed(i);
+            Serial.printf("🎯 Movimiento detectado a %.1f cm (vel: %.1f cm/s) - GPIO %d activado\n",
+              distance, speed, ultrasonicSensors[i].triggerGpioPin);
           }
         }
-        else if (!objectDetected && ultrasonicSensors[i].triggered) {
+        else if (!objectInRange && ultrasonicSensors[i].triggered) {
           // Objeto salió del rango
-          // Si triggerDuration es 0, mantener GPIO activo
-          // Si no, el processUltrasonicTriggers se encargará del timeout
           if (ultrasonicSensors[i].triggerDuration == 0) {
             // Mantener hasta que salga del rango
             ultrasonicSensors[i].triggered = false;
@@ -1101,6 +1163,18 @@ void readUltrasonicSensors() {
               digitalWrite(ultrasonicSensors[i].triggerGpioPin,
                           !ultrasonicSensors[i].triggerGpioValue);
               Serial.printf("📤 Objeto salió del rango - GPIO %d desactivado\n",
+                ultrasonicSensors[i].triggerGpioPin);
+            }
+          }
+        }
+        else if (objectInRange && !objectMoving && ultrasonicSensors[i].triggered) {
+          // Objeto está en rango pero dejó de moverse - desactivar
+          if (ultrasonicSensors[i].triggerDuration == 0) {
+            ultrasonicSensors[i].triggered = false;
+            if (ultrasonicSensors[i].triggerGpioPin >= 0) {
+              digitalWrite(ultrasonicSensors[i].triggerGpioPin,
+                          !ultrasonicSensors[i].triggerGpioValue);
+              Serial.printf("⏹️ Objeto estático detectado - GPIO %d desactivado\n",
                 ultrasonicSensors[i].triggerGpioPin);
             }
           }
