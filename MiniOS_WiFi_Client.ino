@@ -676,6 +676,8 @@ void handleWebSocketMessage(const char* payload) {
     handleConfig(doc);
   } else if (strcmp(type, "command") == 0) {
     handleCommand(doc);
+  } else if (strcmp(type, "scan_i2c") == 0) {
+    scanAndReportI2C();
   }
 }
 
@@ -1365,6 +1367,57 @@ void readI2CSensors() {
       }
     }
   }
+}
+
+void scanAndReportI2C() {
+  Serial.println("🔍 Escaneando bus I2C...");
+
+  StaticJsonDocument<512> doc;
+  doc["type"] = "i2c_scan_result";
+  JsonArray devices = doc.createNestedArray("devices");
+
+  int devicesFound = 0;
+
+  for (uint8_t address = 1; address < 127; address++) {
+    Wire.beginTransmission(address);
+    byte error = Wire.endTransmission();
+
+    if (error == 0) {
+      devicesFound++;
+      JsonObject device = devices.createNestedObject();
+      device["address"] = address;
+
+      // Identificar tipo de sensor por dirección conocida
+      String sensorType = "Unknown";
+      if (address == 0x38) {
+        sensorType = "AHT20";
+      } else if (address == 0x76 || address == 0x77) {
+        sensorType = "BMP280";
+      } else if (address == 0x23) {
+        sensorType = "BH1750";
+      } else if (address == 0x48) {
+        sensorType = "ADS1115";
+      }
+
+      device["sensor_type"] = sensorType;
+
+      Serial.printf("  ✓ Encontrado: 0x%02X", address);
+      if (sensorType != "Unknown") {
+        Serial.printf(" (%s)", sensorType.c_str());
+      }
+      Serial.println();
+    }
+  }
+
+  if (devicesFound == 0) {
+    Serial.println("  ⚠️ No se encontraron dispositivos I2C");
+  } else {
+    Serial.printf("  📊 Total: %d dispositivo(s) encontrado(s)\n", devicesFound);
+  }
+
+  String json;
+  serializeJson(doc, json);
+  webSocket.sendTXT(json);
 }
 
 // ============================================
