@@ -6,8 +6,9 @@
  * - Conexión WebSocket al backend
  * - Identificación por MAC Address
  * - Control GPIO remoto
- * - Sensores DHT
+ * - Sensores DHT e I2C (AHT20, BMP280)
  * - Actualizaciones OTA
+ * - Soporte multi-plataforma: ESP32, ESP32-S3, ESP32-C3
  */
 
 #include <Arduino.h>
@@ -18,14 +19,55 @@
 #include <Update.h>
 #include <Preferences.h>
 #include <DHT.h>
-#include <Adafruit_NeoPixel.h>
 #include <LittleFS.h>
+#include <Wire.h>
+#include <Adafruit_Sensor.h>
+#include <Adafruit_AHTX0.h>
+#include <Adafruit_BMP280.h>
+
+// Incluir NeoPixel solo si el board lo soporta
+#if defined(CONFIG_IDF_TARGET_ESP32S3) || defined(CONFIG_IDF_TARGET_ESP32)
+  #include <Adafruit_NeoPixel.h>
+  #define HAS_RGB_LED true
+#else
+  #define HAS_RGB_LED false
+#endif
+
+// ============================================
+// DETECCIÓN AUTOMÁTICA DE PLATAFORMA
+// ============================================
+
+#if defined(CONFIG_IDF_TARGET_ESP32S3)
+  #define BOARD_MODEL "ESP32-S3"
+  #define BOARD_FAMILY "ESP32-S3"
+  #define LED_RGB_PIN 48
+  #define I2C_SDA_DEFAULT 21
+  #define I2C_SCL_DEFAULT 22
+#elif defined(CONFIG_IDF_TARGET_ESP32C3)
+  #define BOARD_MODEL "ESP32-C3"
+  #define BOARD_FAMILY "ESP32-C3"
+  #define LED_RGB_PIN -1
+  #define I2C_SDA_DEFAULT 8
+  #define I2C_SCL_DEFAULT 9
+#elif defined(CONFIG_IDF_TARGET_ESP32S2)
+  #define BOARD_MODEL "ESP32-S2"
+  #define BOARD_FAMILY "ESP32-S2"
+  #define LED_RGB_PIN -1
+  #define I2C_SDA_DEFAULT 21
+  #define I2C_SCL_DEFAULT 22
+#else
+  #define BOARD_MODEL "ESP32"
+  #define BOARD_FAMILY "ESP32"
+  #define LED_RGB_PIN -1
+  #define I2C_SDA_DEFAULT 21
+  #define I2C_SCL_DEFAULT 22
+#endif
 
 // ============================================
 // CONFIGURACIÓN
 // ============================================
 
-#define FIRMWARE_VERSION "1.0.0"
+#define FIRMWARE_VERSION "2.0.0"
 
 // WiFi - Configurar aquí o vía Serial
 String WIFI_SSID = "CASA ROJAS";
@@ -39,33 +81,63 @@ int BACKEND_PORT = 443;  // Puerto 80 con Nginx, 443 con SSL
 #define MAX_GPIOS 20
 #define MAX_DHT_SENSORS 4
 #define MAX_ULTRASONIC_SENSORS 4
+#define MAX_I2C_SENSORS 4
 
 // Almacenamiento offline de detecciones
 #define DETECTIONS_FILE "/detections.json"
 #define MAX_OFFLINE_DETECTIONS 100  // Máximo de detecciones a guardar offline
 #define LED_STATUS 2  // LED integrado
-#define LED_RGB_PIN 48  // LED RGB NeoPixel integrado ESP32-S3
 #define LED_RGB_COUNT 1
 
 // ============================================
-// CLASIFICACIÓN DE GPIOs ESP32-S3
+// CLASIFICACIÓN DE GPIOs POR PLATAFORMA
 // ============================================
 
-// GPIOs Analógicas (ADC)
-const int ANALOG_GPIOS[] = {1, 2, 4, 5, 6, 7};
-const int ANALOG_GPIOS_COUNT = 6;
+#if defined(CONFIG_IDF_TARGET_ESP32S3)
+  // ESP32-S3: 45 GPIOs disponibles
+  const int ANALOG_GPIOS[] = {1, 2, 4, 5, 6, 7};
+  const int ANALOG_GPIOS_COUNT = 6;
+  const int DIGITAL_GPIOS[] = {0, 3, 14, 15, 16, 17, 18, 19, 20, 21, 36, 37, 38, 39, 40, 41, 42, 45, 46};
+  const int DIGITAL_GPIOS_COUNT = 19;
+  const int I2C_GPIOS[] = {8, 9};  // 8=SDA, 9=SCL
+  const int I2C_GPIOS_COUNT = 2;
+  const int SPI_GPIOS[] = {10, 11, 12, 13};
+  const int SPI_GPIOS_COUNT = 4;
 
-// GPIOs Digitales (uso general)
-const int DIGITAL_GPIOS[] = {0, 3, 14, 15, 16, 17, 18, 19, 20, 21, 36, 37, 38, 39, 40, 41, 42, 45, 46};
-const int DIGITAL_GPIOS_COUNT = 19;
+#elif defined(CONFIG_IDF_TARGET_ESP32C3)
+  // ESP32-C3: 13 GPIOs disponibles (0-10, 18-21)
+  // GPIO 2, 8, 9 son de boot/strapping - usar con precaución
+  const int ANALOG_GPIOS[] = {0, 1, 2, 3, 4};  // ADC1_CH0-4
+  const int ANALOG_GPIOS_COUNT = 5;
+  const int DIGITAL_GPIOS[] = {5, 6, 7, 10, 18, 19, 20, 21};
+  const int DIGITAL_GPIOS_COUNT = 8;
+  const int I2C_GPIOS[] = {8, 9};  // SDA=8, SCL=9 (default C3)
+  const int I2C_GPIOS_COUNT = 2;
+  const int SPI_GPIOS[] = {2, 6, 7, 10};  // MISO, MOSI, SCK, CS
+  const int SPI_GPIOS_COUNT = 4;
 
-// GPIOs I2C (por defecto)
-const int I2C_GPIOS[] = {8, 9};  // 8=SDA, 9=SCL
-const int I2C_GPIOS_COUNT = 2;
+#elif defined(CONFIG_IDF_TARGET_ESP32S2)
+  // ESP32-S2
+  const int ANALOG_GPIOS[] = {1, 2, 3, 4, 5, 6, 7, 8, 9, 10};
+  const int ANALOG_GPIOS_COUNT = 10;
+  const int DIGITAL_GPIOS[] = {0, 11, 12, 13, 14, 15, 16, 17, 18, 21, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42};
+  const int DIGITAL_GPIOS_COUNT = 20;
+  const int I2C_GPIOS[] = {8, 9};
+  const int I2C_GPIOS_COUNT = 2;
+  const int SPI_GPIOS[] = {10, 11, 12, 13};
+  const int SPI_GPIOS_COUNT = 4;
 
-// GPIOs SPI (usar con precaución)
-const int SPI_GPIOS[] = {10, 11, 12, 13};
-const int SPI_GPIOS_COUNT = 4;
+#else
+  // ESP32 estándar
+  const int ANALOG_GPIOS[] = {32, 33, 34, 35, 36, 39};
+  const int ANALOG_GPIOS_COUNT = 6;
+  const int DIGITAL_GPIOS[] = {0, 2, 4, 5, 12, 13, 14, 15, 16, 17, 18, 19, 21, 22, 23, 25, 26, 27};
+  const int DIGITAL_GPIOS_COUNT = 18;
+  const int I2C_GPIOS[] = {21, 22};  // SDA=21, SCL=22 (default)
+  const int I2C_GPIOS_COUNT = 2;
+  const int SPI_GPIOS[] = {5, 18, 19, 23};
+  const int SPI_GPIOS_COUNT = 4;
+#endif
 
 // ============================================
 // ESTRUCTURAS
@@ -109,6 +181,24 @@ struct DHTConfig {
   unsigned long lastRead;
 };
 
+struct I2CConfig {
+  int id;
+  String name;
+  String sensorType;     // "AHT20", "BMP280", "BME280"
+  uint8_t i2cAddress;    // 0x38 (AHT20), 0x76/0x77 (BMP280)
+  bool active;
+  unsigned long readInterval;
+  unsigned long lastRead;
+  // Datos del sensor
+  float temperature;
+  float humidity;        // Solo AHT20/BME280
+  float pressure;        // Solo BMP280/BME280 (hPa)
+  float altitude;        // Solo BMP280/BME280 (m)
+  // Punteros a objetos sensor
+  Adafruit_AHTX0* aht;
+  Adafruit_BMP280* bmp;
+};
+
 struct UltrasonicConfig {
   int id;
   int trigPin;
@@ -148,13 +238,20 @@ struct UltrasonicConfig {
 
 WebSocketsClient webSocket;
 Preferences preferences;
-Adafruit_NeoPixel rgbLed(LED_RGB_COUNT, LED_RGB_PIN, NEO_GRB + NEO_KHZ800);
+
+// LED RGB solo en plataformas compatibles
+#if HAS_RGB_LED
+  Adafruit_NeoPixel rgbLed(LED_RGB_COUNT, LED_RGB_PIN, NEO_GRB + NEO_KHZ800);
+#endif
 
 GPIOConfig gpios[MAX_GPIOS];
 int gpioCount = 0;
 
 DHTConfig dhtSensors[MAX_DHT_SENSORS];
 int dhtCount = 0;
+
+I2CConfig i2cSensors[MAX_I2C_SENSORS];
+int i2cCount = 0;
 
 UltrasonicConfig ultrasonicSensors[MAX_ULTRASONIC_SENSORS];
 int ultrasonicCount = 0;
@@ -193,6 +290,7 @@ void handleConfig(JsonDocument& doc);
 void handleCommand(JsonDocument& doc);
 void sendSensorData();
 void readDHTSensors();
+void readI2CSensors();
 void processGpioLoops();
 void startOTA(int id, String filename, int filesize, String checksum);
 void reportOTAStatus(const char* status, String error);
@@ -235,17 +333,30 @@ void setup() {
 
   Serial.println("\n========================================");
   Serial.println("MiniOS WiFi Client v" FIRMWARE_VERSION);
+  Serial.print("Board: ");
+  Serial.println(BOARD_MODEL);
   Serial.println("========================================");
 
   // LED de estado
   pinMode(LED_STATUS, OUTPUT);
   digitalWrite(LED_STATUS, LOW);
 
-  // LED RGB NeoPixel
-  rgbLed.begin();
-  rgbLed.setBrightness(50);  // Brillo moderado (0-255)
-  rgbLed.clear();
-  rgbLed.show();
+  // LED RGB NeoPixel (solo si está disponible)
+  #if HAS_RGB_LED
+    rgbLed.begin();
+    rgbLed.setBrightness(50);  // Brillo moderado (0-255)
+    rgbLed.clear();
+    rgbLed.show();
+    Serial.println("✅ LED RGB inicializado");
+  #endif
+
+  // Inicializar bus I2C con pines correctos según plataforma
+  Wire.begin(I2C_SDA_DEFAULT, I2C_SCL_DEFAULT);
+  Serial.print("✅ I2C inicializado (SDA:");
+  Serial.print(I2C_SDA_DEFAULT);
+  Serial.print(", SCL:");
+  Serial.print(I2C_SCL_DEFAULT);
+  Serial.println(")");
 
   // Inicializar almacenamiento Flash (LittleFS)
   initLittleFS();
@@ -299,6 +410,9 @@ void loop() {
 
   // Leer sensores DHT
   readDHTSensors();
+
+  // Leer sensores I2C (AHT20, BMP280, etc.)
+  readI2CSensors();
 
   // Leer sensores ultrasónicos y detectar animales
   readUltrasonicSensors();
@@ -425,11 +539,13 @@ float applyFormula(int rawValue, GPIOConfig& gpio) {
 // ============================================
 
 void blinkRGB(uint8_t r, uint8_t g, uint8_t b, int duration) {
-  rgbLed.setPixelColor(0, rgbLed.Color(r, g, b));
-  rgbLed.show();
-  delay(duration);
-  rgbLed.clear();
-  rgbLed.show();
+  #if HAS_RGB_LED
+    rgbLed.setPixelColor(0, rgbLed.Color(r, g, b));
+    rgbLed.show();
+    delay(duration);
+    rgbLed.clear();
+    rgbLed.show();
+  #endif
 }
 
 // ============================================
@@ -530,6 +646,8 @@ void registerDevice() {
   doc["mac_address"] = deviceMac;
   doc["firmware_version"] = FIRMWARE_VERSION;
   doc["ip_address"] = WiFi.localIP().toString();
+  doc["board_model"] = BOARD_MODEL;      // 🆕 Enviar modelo de placa
+  doc["board_family"] = BOARD_FAMILY;    // 🆕 Enviar familia del chip
 
   String json;
   serializeJson(doc, json);
@@ -689,6 +807,74 @@ void handleConfig(JsonDocument& doc) {
 
   Serial.print("Sensores DHT configurados: ");
   Serial.println(dhtCount);
+
+  // Configurar sensores I2C
+  JsonArray i2cArray = doc["i2c"].as<JsonArray>();
+
+  // Limpiar sensores anteriores
+  for (int i = 0; i < i2cCount; i++) {
+    if (i2cSensors[i].aht) delete i2cSensors[i].aht;
+    if (i2cSensors[i].bmp) delete i2cSensors[i].bmp;
+  }
+  i2cCount = 0;
+
+  for (JsonObject i2c : i2cArray) {
+    if (i2cCount >= MAX_I2C_SENSORS) break;
+
+    String sensorType = i2c["sensor_type"].as<String>();
+    uint8_t address = i2c["i2c_address"] | 0x00;
+
+    i2cSensors[i2cCount].id = i2c["id"];
+    i2cSensors[i2cCount].name = i2c["name"].as<String>();
+    i2cSensors[i2cCount].sensorType = sensorType;
+    i2cSensors[i2cCount].i2cAddress = address;
+    i2cSensors[i2cCount].active = i2c["active"] | true;
+    i2cSensors[i2cCount].readInterval = i2c["read_interval"] | 5000;
+    i2cSensors[i2cCount].lastRead = 0;
+    i2cSensors[i2cCount].temperature = 0;
+    i2cSensors[i2cCount].humidity = 0;
+    i2cSensors[i2cCount].pressure = 0;
+    i2cSensors[i2cCount].altitude = 0;
+    i2cSensors[i2cCount].aht = nullptr;
+    i2cSensors[i2cCount].bmp = nullptr;
+
+    // Inicializar sensor según tipo
+    if (sensorType == "AHT20") {
+      i2cSensors[i2cCount].aht = new Adafruit_AHTX0();
+      if (i2cSensors[i2cCount].aht->begin(&Wire, 0, address)) {
+        Serial.printf("✅ AHT20 inicializado en 0x%02X\n", address);
+      } else {
+        Serial.printf("❌ Error inicializando AHT20 en 0x%02X\n", address);
+        delete i2cSensors[i2cCount].aht;
+        i2cSensors[i2cCount].aht = nullptr;
+        continue;
+      }
+    }
+    else if (sensorType == "BMP280") {
+      i2cSensors[i2cCount].bmp = new Adafruit_BMP280();
+      if (i2cSensors[i2cCount].bmp->begin(address)) {
+        Serial.printf("✅ BMP280 inicializado en 0x%02X\n", address);
+        // Configurar oversampling
+        i2cSensors[i2cCount].bmp->setSampling(
+          Adafruit_BMP280::MODE_NORMAL,
+          Adafruit_BMP280::SAMPLING_X2,
+          Adafruit_BMP280::SAMPLING_X16,
+          Adafruit_BMP280::FILTER_X16,
+          Adafruit_BMP280::STANDBY_MS_500
+        );
+      } else {
+        Serial.printf("❌ Error inicializando BMP280 en 0x%02X\n", address);
+        delete i2cSensors[i2cCount].bmp;
+        i2cSensors[i2cCount].bmp = nullptr;
+        continue;
+      }
+    }
+
+    i2cCount++;
+  }
+
+  Serial.print("Sensores I2C configurados: ");
+  Serial.println(i2cCount);
 
   // Configurar sensores ultrasónicos
   JsonArray ultrasonicArray = doc["ultrasonic"].as<JsonArray>();
@@ -1007,6 +1193,35 @@ void sendSensorData() {
     }
   }
 
+  // Agregar sensores I2C (AHT20, BMP280, etc.)
+  if (i2cCount > 0) {
+    JsonArray i2cArray = payload.createNestedArray("i2c");
+    for (int i = 0; i < i2cCount; i++) {
+      if (i2cSensors[i].active) {
+        JsonObject s = i2cArray.createNestedObject();
+        s["id"] = i2cSensors[i].id;
+        s["name"] = i2cSensors[i].name;
+        s["sensor_type"] = i2cSensors[i].sensorType;
+        s["i2c_address"] = i2cSensors[i].i2cAddress;
+
+        if (i2cSensors[i].sensorType == "AHT20") {
+          s["temperature"] = i2cSensors[i].temperature;
+          s["humidity"] = i2cSensors[i].humidity;
+          Serial.printf("I2C[%d] %s temp:%.1f hum:%.1f\n",
+            i, i2cSensors[i].name.c_str(), i2cSensors[i].temperature, i2cSensors[i].humidity);
+        }
+        else if (i2cSensors[i].sensorType == "BMP280") {
+          s["temperature"] = i2cSensors[i].temperature;
+          s["pressure"] = i2cSensors[i].pressure;
+          s["altitude"] = i2cSensors[i].altitude;
+          Serial.printf("I2C[%d] %s temp:%.1f pres:%.1f alt:%.1f\n",
+            i, i2cSensors[i].name.c_str(), i2cSensors[i].temperature,
+            i2cSensors[i].pressure, i2cSensors[i].altitude);
+        }
+      }
+    }
+  }
+
   // Agregar estados GPIO
   JsonArray gpioArray = payload.createNestedArray("gpio");
   for (int i = 0; i < gpioCount; i++) {
@@ -1113,6 +1328,40 @@ void readDHTSensors() {
         dhtSensors[i].humidity = h;
       } else {
         Serial.printf("⚠️ Error leyendo DHT pin %d\n", dhtSensors[i].pin);
+      }
+    }
+  }
+}
+
+// ============================================
+// SENSORES I2C
+// ============================================
+
+void readI2CSensors() {
+  for (int i = 0; i < i2cCount; i++) {
+    if (!i2cSensors[i].active) continue;
+
+    if (millis() - i2cSensors[i].lastRead >= i2cSensors[i].readInterval) {
+      i2cSensors[i].lastRead = millis();
+
+      if (i2cSensors[i].sensorType == "AHT20" && i2cSensors[i].aht) {
+        sensors_event_t humidity, temp;
+        if (i2cSensors[i].aht->getEvent(&humidity, &temp)) {
+          i2cSensors[i].temperature = temp.temperature;
+          i2cSensors[i].humidity = humidity.relative_humidity;
+        } else {
+          Serial.printf("⚠️ Error leyendo AHT20 [%s]\n", i2cSensors[i].name.c_str());
+        }
+      }
+      else if (i2cSensors[i].sensorType == "BMP280" && i2cSensors[i].bmp) {
+        i2cSensors[i].temperature = i2cSensors[i].bmp->readTemperature();
+        float pressure_pa = i2cSensors[i].bmp->readPressure();
+        i2cSensors[i].pressure = pressure_pa / 100.0f;  // Convertir a hPa
+        i2cSensors[i].altitude = i2cSensors[i].bmp->readAltitude(1013.25);  // Presión nivel del mar estándar
+
+        if (isnan(i2cSensors[i].temperature) || isnan(i2cSensors[i].pressure)) {
+          Serial.printf("⚠️ Error leyendo BMP280 [%s]\n", i2cSensors[i].name.c_str());
+        }
       }
     }
   }
