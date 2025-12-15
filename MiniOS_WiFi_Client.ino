@@ -70,7 +70,7 @@
 #define FIRMWARE_VERSION "2.0.0"
 
 // WiFi - Configurar aquí o vía Serial
-String WIFI_SSID = "CASA ROJAS";
+String WIFI_SSID = "CASA ROJAS_Plus";
 String WIFI_PASS = "STD2024....";
 
 // Backend
@@ -88,6 +88,11 @@ int BACKEND_PORT = 443;  // Puerto 80 con Nginx, 443 con SSL
 #define MAX_OFFLINE_DETECTIONS 100  // Máximo de detecciones a guardar offline
 #define LED_STATUS 2  // LED integrado
 #define LED_RGB_COUNT 1
+
+// Ahorro de energía - Deep Sleep
+#define DEEP_SLEEP_ENABLED true
+#define DEEP_SLEEP_DURATION 60  // segundos entre lecturas
+#define SENSOR_READ_TIMEOUT 15000  // 15s timeout para leer sensores y enviar
 
 // ============================================
 // CLASIFICACIÓN DE GPIOs POR PLATAFORMA
@@ -323,6 +328,9 @@ int countPendingDetections();
 // LED RGB
 void blinkRGB(uint8_t r, uint8_t g, uint8_t b, int duration = 50);
 
+// Ahorro de energía
+void enterDeepSleep(unsigned long seconds);
+
 // ============================================
 // SETUP
 // ============================================
@@ -330,6 +338,18 @@ void blinkRGB(uint8_t r, uint8_t g, uint8_t b, int duration = 50);
 void setup() {
   Serial.begin(115200);
   delay(1000);
+
+  // Mostrar razón de wake-up
+  esp_sleep_wakeup_cause_t wakeup_reason = esp_sleep_get_wakeup_cause();
+  switch(wakeup_reason) {
+    case ESP_SLEEP_WAKEUP_TIMER:
+      Serial.println("⏰ Wake up: Timer (Deep Sleep)");
+      break;
+    case ESP_SLEEP_WAKEUP_UNDEFINED:
+    default:
+      Serial.println("🔌 Wake up: Power on / Reset");
+      break;
+  }
 
   Serial.println("\n========================================");
   Serial.println("MiniOS WiFi Client v" FIRMWARE_VERSION);
@@ -400,50 +420,84 @@ void setup() {
 // ============================================
 
 void loop() {
-  // Procesar comandos Serial
-  handleSerial();
+  static bool taskCompleted = false;
 
-  // =============================================
-  // SENSORES Y DETECCIÓN (SIEMPRE FUNCIONAN)
-  // Funcionan independientemente del estado WiFi
-  // =============================================
-
-  // Leer sensores DHT
-  readDHTSensors();
-
-  // Leer sensores I2C (AHT20, BMP280, etc.)
-  readI2CSensors();
-
-  // Leer sensores ultrasónicos y detectar animales
-  readUltrasonicSensors();
-
-  // Procesar triggers de ultrasónicos (activar GPIOs)
-  processUltrasonicTriggers();
-
-  // Procesar loops GPIO
-  processGpioLoops();
-
-  // =============================================
-  // CONECTIVIDAD (SOLO SI HAY WIFI)
-  // =============================================
-
-  // Verificar conexión WiFi
-  if (WiFi.status() != WL_CONNECTED) {
-    if (millis() - lastReconnect > RECONNECT_INTERVAL) {
-      lastReconnect = millis();
-      Serial.println("📡 Intentando reconectar WiFi...");
-      connectWiFi();
-    }
-    return; // Solo salta la parte de envío de datos
+  if (taskCompleted) {
+    // Ya terminamos, esperar a que Deep Sleep se active
+    delay(1000);
+    return;
   }
 
-  // WebSocket loop (mantener conexión)
-  webSocket.loop();
+  unsigned long startTime = millis();
 
-  // Enviar datos periódicamente (solo si está registrado)
-  if (isRegistered && millis() - lastDataSend > DATA_SEND_INTERVAL) {
-    lastDataSend = millis();
+  // 1. Procesar comandos Serial (solo por 2 segundos)
+  while (millis() - startTime < 2000 && Serial.available()) {
+    handleSerial();
+    delay(10);
+  }
+
+  // 2. Verificar WiFi
+  if (WiFi.status() != WL_CONNECTED) {
+    Serial.println("❌ Sin WiFi, reintentando...");
+    connectWiFi();
+
+    if (WiFi.status() != WL_CONNECTED) {
+      Serial.println("❌ No se pudo conectar WiFi");
+      if (DEEP_SLEEP_ENABLED) {
+        enterDeepSleep(DEEP_SLEEP_DURATION);
+      }
+      return;
+    }
+  }
+
+  // 3. Conectar WebSocket si no está conectado
+  if (!isRegistered) {
+    connectWebSocket();
+
+    // Esperar conexión (timeout 10s)
+    unsigned long wsStart = millis();
+    while (!isRegistered && millis() - wsStart < 10000) {
+      webSocket.loop();
+      delay(100);
+    }
+
+    if (!isRegistered) {
+      Serial.println("⚠️ No se pudo registrar en backend");
+    }
+  }
+
+  // 4. Leer TODOS los sensores
+  Serial.println("📊 Leyendo sensores...");
+  readDHTSensors();
+  readI2CSensors();
+  readUltrasonicSensors();  // Lee y detecta
+  processUltrasonicTriggers();  // Procesa triggers
+
+  // 5. Enviar datos
+  if (isRegistered) {
+    Serial.println("📤 Enviando datos...");
     sendSensorData();
+
+    // Enviar detecciones offline si hay
+    if (pendingDetections > 0) {
+      sendPendingDetections();
+    }
+
+    // Esperar confirmación
+    delay(1000);
+    webSocket.loop();
+  }
+
+  // 6. Marcar como completado
+  taskCompleted = true;
+
+  // 7. Entrar en Deep Sleep
+  if (DEEP_SLEEP_ENABLED) {
+    enterDeepSleep(DEEP_SLEEP_DURATION);
+  } else {
+    Serial.println("💡 Deep Sleep deshabilitado, esperando...");
+    delay(DEEP_SLEEP_DURATION * 1000);
+    taskCompleted = false;  // Repetir ciclo
   }
 }
 
@@ -572,6 +626,10 @@ void connectWiFi() {
     Serial.println("\n✅ WiFi conectado");
     Serial.print("IP: ");
     Serial.println(WiFi.localIP());
+
+    // Habilitar WiFi sleep mode para ahorro de energía
+    WiFi.setSleep(WIFI_PS_MIN_MODEM);  // Ahorro moderado, mantiene conexión
+    Serial.println("💤 WiFi Sleep Mode habilitado");
 
     digitalWrite(LED_STATUS, HIGH);
 
@@ -1370,49 +1428,24 @@ void readI2CSensors() {
 }
 
 void scanAndReportI2C() {
-  Serial.println("🔍 Escaneando bus I2C...");
-
   StaticJsonDocument<512> doc;
   doc["type"] = "i2c_scan_result";
   JsonArray devices = doc.createNestedArray("devices");
 
-  int devicesFound = 0;
+  for (uint8_t addr = 1; addr < 127; addr++) {
+    Wire.beginTransmission(addr);
+    if (Wire.endTransmission() == 0) {
+      JsonObject dev = devices.createNestedObject();
+      dev["address"] = addr;
 
-  for (uint8_t address = 1; address < 127; address++) {
-    Wire.beginTransmission(address);
-    byte error = Wire.endTransmission();
+      const char* type = "Unknown";
+      if (addr == 0x38) type = "AHT20";
+      else if (addr == 0x76 || addr == 0x77) type = "BMP280";
+      else if (addr == 0x23) type = "BH1750";
+      else if (addr == 0x48) type = "ADS1115";
 
-    if (error == 0) {
-      devicesFound++;
-      JsonObject device = devices.createNestedObject();
-      device["address"] = address;
-
-      // Identificar tipo de sensor por dirección conocida
-      String sensorType = "Unknown";
-      if (address == 0x38) {
-        sensorType = "AHT20";
-      } else if (address == 0x76 || address == 0x77) {
-        sensorType = "BMP280";
-      } else if (address == 0x23) {
-        sensorType = "BH1750";
-      } else if (address == 0x48) {
-        sensorType = "ADS1115";
-      }
-
-      device["sensor_type"] = sensorType;
-
-      Serial.printf("  ✓ Encontrado: 0x%02X", address);
-      if (sensorType != "Unknown") {
-        Serial.printf(" (%s)", sensorType.c_str());
-      }
-      Serial.println();
+      dev["sensor_type"] = type;
     }
-  }
-
-  if (devicesFound == 0) {
-    Serial.println("  ⚠️ No se encontraron dispositivos I2C");
-  } else {
-    Serial.printf("  📊 Total: %d dispositivo(s) encontrado(s)\n", devicesFound);
   }
 
   String json;
@@ -2014,4 +2047,35 @@ void handleSerial() {
   else {
     Serial.println("Comando no reconocido");
   }
+}
+
+// ============================================
+// AHORRO DE ENERGÍA - DEEP SLEEP
+// ============================================
+
+void enterDeepSleep(unsigned long seconds) {
+  Serial.println("\n========================================");
+  Serial.printf("💤 Entrando en Deep Sleep por %lu segundos\n", seconds);
+  Serial.println("========================================\n");
+
+  // Guardar cualquier dato pendiente
+  Serial.flush();
+  delay(100);
+
+  // Configurar timer para despertar
+  esp_sleep_enable_timer_wakeup(seconds * 1000000ULL);  // microsegundos
+
+  // Apagar LED
+  digitalWrite(LED_STATUS, LOW);
+  #if HAS_RGB_LED
+    rgbLed.clear();
+    rgbLed.show();
+  #endif
+
+  // Entrar en Deep Sleep
+  Serial.println("😴 Durmiendo...");
+  delay(100);
+  esp_deep_sleep_start();
+
+  // Esta línea nunca se ejecuta (el ESP32 se reinicia al despertar)
 }
