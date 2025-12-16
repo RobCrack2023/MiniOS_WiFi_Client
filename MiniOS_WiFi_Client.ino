@@ -483,15 +483,26 @@ void loop() {
       sendPendingDetections();
     }
 
-    // Esperar confirmación
-    delay(1000);
-    webSocket.loop();
+    // 6. Mantener conexión activa por 15 segundos para recibir comandos
+    // Esto permite que el backend envíe comandos (como scan_i2c)
+    Serial.println("⏳ Esperando comandos por 15 segundos...");
+    unsigned long commandWaitStart = millis();
+    while (millis() - commandWaitStart < 15000) {  // 15 segundos
+      webSocket.loop();  // Procesar mensajes WebSocket entrantes
+      delay(100);
+
+      // Si hay comandos Serial, procesarlos
+      if (Serial.available()) {
+        handleSerial();
+      }
+    }
+    Serial.println("✅ Tiempo de espera completado");
   }
 
-  // 6. Marcar como completado
+  // 7. Marcar como completado
   taskCompleted = true;
 
-  // 7. Entrar en Deep Sleep
+  // 8. Entrar en Deep Sleep
   if (DEEP_SLEEP_ENABLED) {
     enterDeepSleep(DEEP_SLEEP_DURATION);
   } else {
