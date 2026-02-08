@@ -70,8 +70,8 @@
 #define FIRMWARE_VERSION "2.0.0"
 
 // WiFi - Configurar aquí o vía Serial
-String WIFI_SSID = "CASA ROJAS_Plus";
-String WIFI_PASS = "STD2024....";
+String WIFI_SSID = "CASA ROJAS";
+String WIFI_PASS = "26ROJASM";
 
 // Backend
 String BACKEND_HOST = "minios.iot-robotics.cl";  // Dominio del backend
@@ -265,6 +265,12 @@ String deviceMac;
 int deviceId = 0;
 bool isRegistered = false;
 
+// Sincronización de tiempo
+String serverTimezone = "America/Santiago";
+bool timeSync = false;
+unsigned long lastTimeSync = 0;
+const unsigned long TIME_SYNC_INTERVAL = 3600000;  // Re-sincronizar cada hora
+
 unsigned long lastDataSend = 0;
 const unsigned long DATA_SEND_INTERVAL = 5000;
 
@@ -290,6 +296,7 @@ void connectWiFi();
 void connectWebSocket();
 void webSocketEvent(WStype_t type, uint8_t* payload, size_t length);
 void registerDevice();
+void syncTimeWithBackend();
 void handleWebSocketMessage(const char* payload);
 void handleConfig(JsonDocument& doc);
 void handleCommand(JsonDocument& doc);
@@ -466,14 +473,19 @@ void loop() {
     }
   }
 
-  // 4. Leer TODOS los sensores
+  // 4. Re-sincronizar hora si es necesario (cada hora)
+  if (timeSync && millis() - lastTimeSync > TIME_SYNC_INTERVAL) {
+    syncTimeWithBackend();
+  }
+
+  // 5. Leer TODOS los sensores
   Serial.println("📊 Leyendo sensores...");
   readDHTSensors();
   readI2CSensors();
   readUltrasonicSensors();  // Lee y detecta
   processUltrasonicTriggers();  // Procesa triggers
 
-  // 5. Enviar datos
+  // 6. Enviar datos
   if (isRegistered) {
     Serial.println("📤 Enviando datos...");
     sendSensorData();
@@ -729,6 +741,61 @@ void registerDevice() {
   blinkRGB(0, 255, 0);  // Verde: datos enviados
 }
 
+void syncTimeWithBackend() {
+  Serial.println("🕐 Sincronizando hora con el servidor...");
+
+  HTTPClient http;
+  String url = String("http") + (BACKEND_PORT == 443 ? "s" : "") + "://" +
+               BACKEND_HOST + ":" + String(BACKEND_PORT) + "/api/time";
+
+  http.begin(url);
+  http.setTimeout(5000);
+
+  int httpCode = http.GET();
+
+  if (httpCode == HTTP_CODE_OK) {
+    String payload = http.getString();
+    StaticJsonDocument<256> doc;
+    DeserializationError error = deserializeJson(doc, payload);
+
+    if (!error) {
+      unsigned long timestamp = doc["timestamp"];
+      const char* timezone = doc["timezone"];
+
+      if (timezone) {
+        serverTimezone = String(timezone);
+      }
+
+      // Configurar hora del sistema ESP32
+      // configTime requiere GMT offset y daylight offset, pero como el servidor
+      // ya nos da el timestamp correcto ajustado, usamos GMT offset 0
+      configTime(0, 0, "pool.ntp.org");  // Servidor NTP como fallback
+
+      // Establecer la hora directamente desde el timestamp del servidor
+      struct timeval tv;
+      tv.tv_sec = timestamp;
+      tv.tv_usec = 0;
+      settimeofday(&tv, NULL);
+
+      timeSync = true;
+      lastTimeSync = millis();
+
+      Serial.printf("✅ Hora sincronizada: %lu (Timezone: %s)\n", timestamp, serverTimezone.c_str());
+
+      // Mostrar hora actual
+      time_t now = time(nullptr);
+      Serial.print("📅 Fecha/Hora actual: ");
+      Serial.println(ctime(&now));
+    } else {
+      Serial.println("❌ Error parseando respuesta de tiempo");
+    }
+  } else {
+    Serial.printf("❌ Error obteniendo hora del servidor (HTTP %d)\n", httpCode);
+  }
+
+  http.end();
+}
+
 void handleWebSocketMessage(const char* payload) {
   StaticJsonDocument<2048> doc;
   DeserializationError error = deserializeJson(doc, payload);
@@ -756,6 +823,11 @@ void handleConfig(JsonDocument& doc) {
 
   Serial.print("✅ Registrado como dispositivo ID: ");
   Serial.println(deviceId);
+
+  // Sincronizar hora con el servidor
+  if (!timeSync) {
+    syncTimeWithBackend();
+  }
 
   // Enviar detecciones pendientes offline
   if (pendingDetections > 0) {
@@ -1244,6 +1316,12 @@ void sendSensorData() {
   StaticJsonDocument<2048> doc;
   doc["type"] = "data";
   doc["mac_address"] = deviceMac;
+
+  // Agregar timestamp Unix si el tiempo está sincronizado
+  if (timeSync) {
+    time_t now = time(nullptr);
+    doc["timestamp"] = now;
+  }
 
   JsonObject payload = doc.createNestedObject("payload");
 
