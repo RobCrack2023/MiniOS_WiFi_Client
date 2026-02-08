@@ -271,6 +271,9 @@ bool timeSync = false;
 unsigned long lastTimeSync = 0;
 const unsigned long TIME_SYNC_INTERVAL = 3600000;  // Re-sincronizar cada hora
 
+// Control de Deep Sleep
+bool disableDeepSleep = false;  // Flag para desactivar deep sleep (útil para OTA/debugging)
+
 unsigned long lastDataSend = 0;
 const unsigned long DATA_SEND_INTERVAL = 5000;
 
@@ -414,6 +417,35 @@ void setup() {
   Serial.println("  status - Ver estado");
   Serial.println("  reboot - Reiniciar");
 
+  // Prompt para desactivar Deep Sleep (útil para subir firmware)
+  #if DEEP_SLEEP_ENABLED
+    Serial.println("\n⚠️  Deep Sleep ACTIVADO");
+    Serial.println("Presiona cualquier tecla en 10 segundos para DESACTIVAR Deep Sleep");
+    Serial.println("(útil para subir nuevo firmware vía USB)");
+
+    unsigned long startPrompt = millis();
+    while (millis() - startPrompt < 10000) {  // Esperar 10 segundos
+      if (Serial.available()) {
+        // Leer y descartar la entrada
+        while (Serial.available()) Serial.read();
+        disableDeepSleep = true;
+        Serial.println("\n✅ Deep Sleep DESACTIVADO - Modo normal continuo");
+        Serial.println("El dispositivo permanecerá despierto para programación OTA/USB");
+        break;
+      }
+      delay(100);
+
+      // Mostrar countdown cada segundo
+      if ((millis() - startPrompt) % 1000 == 0) {
+        Serial.print(".");
+      }
+    }
+
+    if (!disableDeepSleep) {
+      Serial.println("\n⏰ Continuando con Deep Sleep activado");
+    }
+  #endif
+
   // Conectar WiFi
   if (WIFI_SSID.length() > 0) {
     connectWiFi();
@@ -450,7 +482,7 @@ void loop() {
 
     if (WiFi.status() != WL_CONNECTED) {
       Serial.println("❌ No se pudo conectar WiFi");
-      if (DEEP_SLEEP_ENABLED) {
+      if (DEEP_SLEEP_ENABLED && !disableDeepSleep) {
         enterDeepSleep(DEEP_SLEEP_DURATION);
       }
       return;
@@ -514,8 +546,8 @@ void loop() {
   // 7. Marcar como completado
   taskCompleted = true;
 
-  // 8. Entrar en Deep Sleep
-  if (DEEP_SLEEP_ENABLED) {
+  // 8. Entrar en Deep Sleep (solo si no está desactivado)
+  if (DEEP_SLEEP_ENABLED && !disableDeepSleep) {
     enterDeepSleep(DEEP_SLEEP_DURATION);
   } else {
     Serial.println("💡 Deep Sleep deshabilitado, esperando...");
