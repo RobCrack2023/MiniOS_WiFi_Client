@@ -766,12 +766,15 @@ void syncTimeWithBackend() {
         serverTimezone = String(timezone);
       }
 
-      // Configurar hora del sistema ESP32
-      // configTime requiere GMT offset y daylight offset, pero como el servidor
-      // ya nos da el timestamp correcto ajustado, usamos GMT offset 0
-      configTime(0, 0, "pool.ntp.org");  // Servidor NTP como fallback
+      // Configurar hora del sistema ESP32 con timezone de Chile
+      // Chile: UTC-3 (verano feb-mar, sep-nov) o UTC-4 (invierno abr-ago)
+      // Usamos UTC-3 como default (horario de verano)
+      long gmtOffset_sec = -3 * 3600;  // -3 horas en segundos
+      int daylightOffset_sec = 0;       // Sin DST adicional
 
-      // Establecer la hora directamente desde el timestamp del servidor
+      configTime(gmtOffset_sec, daylightOffset_sec, "pool.ntp.org");
+
+      // Establecer la hora directamente desde el timestamp del servidor (UTC)
       struct timeval tv;
       tv.tv_sec = timestamp;
       tv.tv_usec = 0;
