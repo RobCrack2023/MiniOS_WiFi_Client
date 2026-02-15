@@ -360,7 +360,9 @@ void setup() {
 
   // Inicializar bus I2C con pines correctos según plataforma
   Wire.begin(I2C_SDA_DEFAULT, I2C_SCL_DEFAULT);
-  Serial.print("✅ I2C inicializado (SDA:");
+  Wire.setClock(100000);  // 100kHz: más compatible con módulos AHT20+BMP280 combo
+  delay(100);             // Dar tiempo a los sensores I2C para estabilizarse tras encendido
+  Serial.print("✅ I2C inicializado 100kHz (SDA:");
   Serial.print(I2C_SDA_DEFAULT);
   Serial.print(", SCL:");
   Serial.print(I2C_SCL_DEFAULT);
@@ -989,13 +991,18 @@ void handleConfig(JsonDocument& doc) {
     i2cSensors[i2cCount].bmp = nullptr;
     i2cSensors[i2cCount].bme = nullptr;
 
-    // Inicializar sensor según tipo
+    // Inicializar sensor según tipo (con 3 reintentos y 100ms entre ellos)
+    bool sensorOk = false;
     if (sensorType == "AHT20") {
       i2cSensors[i2cCount].aht = new Adafruit_AHTX0();
-      if (i2cSensors[i2cCount].aht->begin(&Wire, 0, address)) {
+      for (int attempt = 0; attempt < 3 && !sensorOk; attempt++) {
+        if (attempt > 0) delay(100);
+        sensorOk = i2cSensors[i2cCount].aht->begin(&Wire, 0, address);
+      }
+      if (sensorOk) {
         Serial.printf("✅ AHT20 inicializado en 0x%02X\n", address);
       } else {
-        Serial.printf("❌ Error inicializando AHT20 en 0x%02X\n", address);
+        Serial.printf("❌ Error inicializando AHT20 en 0x%02X (verifique cableado y dirección)\n", address);
         delete i2cSensors[i2cCount].aht;
         i2cSensors[i2cCount].aht = nullptr;
         continue;
@@ -1003,7 +1010,11 @@ void handleConfig(JsonDocument& doc) {
     }
     else if (sensorType == "BMP280") {
       i2cSensors[i2cCount].bmp = new Adafruit_BMP280();
-      if (i2cSensors[i2cCount].bmp->begin(address)) {
+      for (int attempt = 0; attempt < 3 && !sensorOk; attempt++) {
+        if (attempt > 0) delay(100);
+        sensorOk = i2cSensors[i2cCount].bmp->begin(address);
+      }
+      if (sensorOk) {
         Serial.printf("✅ BMP280 inicializado en 0x%02X\n", address);
         i2cSensors[i2cCount].bmp->setSampling(
           Adafruit_BMP280::MODE_NORMAL,
@@ -1013,7 +1024,7 @@ void handleConfig(JsonDocument& doc) {
           Adafruit_BMP280::STANDBY_MS_500
         );
       } else {
-        Serial.printf("❌ Error inicializando BMP280 en 0x%02X\n", address);
+        Serial.printf("❌ Error inicializando BMP280 en 0x%02X (verifique cableado y dirección)\n", address);
         delete i2cSensors[i2cCount].bmp;
         i2cSensors[i2cCount].bmp = nullptr;
         continue;
@@ -1021,7 +1032,11 @@ void handleConfig(JsonDocument& doc) {
     }
     else if (sensorType == "BME280") {
       i2cSensors[i2cCount].bme = new Adafruit_BME280();
-      if (i2cSensors[i2cCount].bme->begin(address, &Wire)) {
+      for (int attempt = 0; attempt < 3 && !sensorOk; attempt++) {
+        if (attempt > 0) delay(100);
+        sensorOk = i2cSensors[i2cCount].bme->begin(address, &Wire);
+      }
+      if (sensorOk) {
         Serial.printf("✅ BME280 inicializado en 0x%02X\n", address);
         i2cSensors[i2cCount].bme->setSampling(
           Adafruit_BME280::MODE_NORMAL,
@@ -1032,7 +1047,7 @@ void handleConfig(JsonDocument& doc) {
           Adafruit_BME280::STANDBY_MS_500
         );
       } else {
-        Serial.printf("❌ Error inicializando BME280 en 0x%02X\n", address);
+        Serial.printf("❌ Error inicializando BME280 en 0x%02X (verifique cableado y dirección)\n", address);
         delete i2cSensors[i2cCount].bme;
         i2cSensors[i2cCount].bme = nullptr;
         continue;
@@ -1367,50 +1382,66 @@ void handleCommand(JsonDocument& doc) {
       i2cSensors[i2cCount].bmp         = nullptr;
       i2cSensors[i2cCount].bme         = nullptr;
 
+      bool sensorOk2 = false;
       if (sensorType == "AHT20") {
         i2cSensors[i2cCount].aht = new Adafruit_AHTX0();
-        if (!i2cSensors[i2cCount].aht->begin(&Wire, 0, address)) {
+        for (int attempt = 0; attempt < 3 && !sensorOk2; attempt++) {
+          if (attempt > 0) delay(100);
+          sensorOk2 = i2cSensors[i2cCount].aht->begin(&Wire, 0, address);
+        }
+        if (sensorOk2) {
+          Serial.printf("✅ AHT20 inicializado en 0x%02X\n", address);
+        } else {
           Serial.printf("❌ Error inicializando AHT20 en 0x%02X\n", address);
           delete i2cSensors[i2cCount].aht;
           i2cSensors[i2cCount].aht = nullptr;
           continue;
         }
-        Serial.printf("✅ AHT20 inicializado en 0x%02X\n", address);
       }
       else if (sensorType == "BMP280") {
         i2cSensors[i2cCount].bmp = new Adafruit_BMP280();
-        if (!i2cSensors[i2cCount].bmp->begin(address)) {
+        for (int attempt = 0; attempt < 3 && !sensorOk2; attempt++) {
+          if (attempt > 0) delay(100);
+          sensorOk2 = i2cSensors[i2cCount].bmp->begin(address);
+        }
+        if (sensorOk2) {
+          i2cSensors[i2cCount].bmp->setSampling(
+            Adafruit_BMP280::MODE_NORMAL,
+            Adafruit_BMP280::SAMPLING_X2,
+            Adafruit_BMP280::SAMPLING_X16,
+            Adafruit_BMP280::FILTER_X16,
+            Adafruit_BMP280::STANDBY_MS_500
+          );
+          Serial.printf("✅ BMP280 inicializado en 0x%02X\n", address);
+        } else {
           Serial.printf("❌ Error inicializando BMP280 en 0x%02X\n", address);
           delete i2cSensors[i2cCount].bmp;
           i2cSensors[i2cCount].bmp = nullptr;
           continue;
         }
-        i2cSensors[i2cCount].bmp->setSampling(
-          Adafruit_BMP280::MODE_NORMAL,
-          Adafruit_BMP280::SAMPLING_X2,
-          Adafruit_BMP280::SAMPLING_X16,
-          Adafruit_BMP280::FILTER_X16,
-          Adafruit_BMP280::STANDBY_MS_500
-        );
-        Serial.printf("✅ BMP280 inicializado en 0x%02X\n", address);
       }
       else if (sensorType == "BME280") {
         i2cSensors[i2cCount].bme = new Adafruit_BME280();
-        if (!i2cSensors[i2cCount].bme->begin(address, &Wire)) {
+        for (int attempt = 0; attempt < 3 && !sensorOk2; attempt++) {
+          if (attempt > 0) delay(100);
+          sensorOk2 = i2cSensors[i2cCount].bme->begin(address, &Wire);
+        }
+        if (sensorOk2) {
+          i2cSensors[i2cCount].bme->setSampling(
+            Adafruit_BME280::MODE_NORMAL,
+            Adafruit_BME280::SAMPLING_X2,
+            Adafruit_BME280::SAMPLING_X16,
+            Adafruit_BME280::SAMPLING_X16,
+            Adafruit_BME280::FILTER_X16,
+            Adafruit_BME280::STANDBY_MS_500
+          );
+          Serial.printf("✅ BME280 inicializado en 0x%02X\n", address);
+        } else {
           Serial.printf("❌ Error inicializando BME280 en 0x%02X\n", address);
           delete i2cSensors[i2cCount].bme;
           i2cSensors[i2cCount].bme = nullptr;
           continue;
         }
-        i2cSensors[i2cCount].bme->setSampling(
-          Adafruit_BME280::MODE_NORMAL,
-          Adafruit_BME280::SAMPLING_X2,
-          Adafruit_BME280::SAMPLING_X16,
-          Adafruit_BME280::SAMPLING_X16,
-          Adafruit_BME280::FILTER_X16,
-          Adafruit_BME280::STANDBY_MS_500
-        );
-        Serial.printf("✅ BME280 inicializado en 0x%02X\n", address);
       }
 
       i2cCount++;
