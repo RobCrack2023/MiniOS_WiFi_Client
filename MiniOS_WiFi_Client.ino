@@ -19,7 +19,6 @@
 #include <Update.h>
 #include <Preferences.h>
 #include <DHT.h>
-#include <LittleFS.h>
 #include <Wire.h>
 #include <Adafruit_Sensor.h>
 #include <Adafruit_AHTX0.h>
@@ -83,9 +82,6 @@ int BACKEND_PORT = 443;  // Puerto 80 con Nginx, 443 con SSL
 #define MAX_ULTRASONIC_SENSORS 4
 #define MAX_I2C_SENSORS 4
 
-// Almacenamiento offline de detecciones
-#define DETECTIONS_FILE "/detections.json"
-#define MAX_OFFLINE_DETECTIONS 100  // Máximo de detecciones a guardar offline
 #define LED_STATUS 2  // LED integrado
 #define LED_RGB_COUNT 1
 
@@ -225,15 +221,8 @@ struct UltrasonicConfig {
   float distanceBuffer[10];  // Últimas 10 lecturas para mejor análisis
   int bufferIndex;
   bool bufferFull;
-  // Detección inteligente de animales (local)
-  bool smartDetectionEnabled;
-  String targetAnimal;       // "any", "mouse", "cat", "both"
-  float mouseMaxSpeed;       // cm/s - velocidad máxima para ratón
-  int mouseMaxDuration;      // ms - duración máxima para ratón
-  int catMinDuration;        // ms - duración mínima para gato
   // Estado de detección actual
   unsigned long detectionStartTime;
-  String detectedAnimal;
   float currentSpeed;
 };
 
@@ -287,10 +276,6 @@ String otaFilename = "";
 int otaFilesize = 0;
 String otaChecksum = "";
 
-// Almacenamiento offline
-bool littleFsReady = false;
-int pendingDetections = 0;
-
 // ============================================
 // PROTOTIPOS DE FUNCIONES
 // ============================================
@@ -326,15 +311,6 @@ void readUltrasonicSensors();
 void processUltrasonicTriggers();
 float calculateMovementSpeed(int sensorIndex);
 bool isObjectMoving(int sensorIndex);
-String classifyAnimal(int sensorIndex);
-bool shouldTriggerForAnimal(int sensorIndex, String detectedAnimal);
-
-// Almacenamiento offline
-void initLittleFS();
-void saveOfflineDetection(String animalType, float distance, float speed, unsigned long duration);
-void sendPendingDetections();
-int countPendingDetections();
-
 // LED RGB
 void blinkRGB(uint8_t r, uint8_t g, uint8_t b, int duration = 50);
 
@@ -387,9 +363,6 @@ void setup() {
   Serial.print(", SCL:");
   Serial.print(I2C_SCL_DEFAULT);
   Serial.println(")");
-
-  // Inicializar almacenamiento Flash (LittleFS)
-  initLittleFS();
 
   // Inicializar WiFi para obtener MAC
   WiFi.mode(WIFI_STA);
@@ -522,25 +495,27 @@ void loop() {
     Serial.println("📤 Enviando datos...");
     sendSensorData();
 
-    // Enviar detecciones offline si hay
-    if (pendingDetections > 0) {
-      sendPendingDetections();
+    // 6. Ventana de comandos: primero drenar mensajes pendientes del backend
+    // (comandos encolados mientras el dispositivo estaba dormido llegan aquí primero)
+    Serial.println("⏳ Procesando comandos pendientes...");
+    unsigned long drainStart = millis();
+    while (millis() - drainStart < 3000) {
+      webSocket.loop();
+      delay(50);
     }
 
-    // 6. Mantener conexión activa por 15 segundos para recibir comandos
-    // Esto permite que el backend envíe comandos (como scan_i2c)
-    Serial.println("⏳ Esperando comandos por 15 segundos...");
+    // Luego mantener ventana activa para comandos en tiempo real
+    Serial.println("⏳ Ventana de comandos abierta (15 segundos)...");
     unsigned long commandWaitStart = millis();
-    while (millis() - commandWaitStart < 15000) {  // 15 segundos
-      webSocket.loop();  // Procesar mensajes WebSocket entrantes
+    while (millis() - commandWaitStart < 15000) {
+      webSocket.loop();
       delay(100);
 
-      // Si hay comandos Serial, procesarlos
       if (Serial.available()) {
         handleSerial();
       }
     }
-    Serial.println("✅ Tiempo de espera completado");
+    Serial.println("✅ Ventana de comandos cerrada.");
   }
 
   // 7. Marcar como completado
@@ -864,12 +839,6 @@ void handleConfig(JsonDocument& doc) {
     syncTimeWithBackend();
   }
 
-  // Enviar detecciones pendientes offline
-  if (pendingDetections > 0) {
-    Serial.printf("📤 Hay %d detecciones offline pendientes\n", pendingDetections);
-    sendPendingDetections();
-  }
-
   // Configurar GPIOs
   JsonArray gpioArray = doc["gpio"].as<JsonArray>();
   gpioCount = 0;
@@ -1088,19 +1057,8 @@ void handleConfig(JsonDocument& doc) {
       ultrasonicSensors[ultrasonicCount].distanceBuffer[j] = -1;
     }
 
-    // Parámetros de detección inteligente (desde backend)
-    ultrasonicSensors[ultrasonicCount].smartDetectionEnabled = us["smart_detection_enabled"] | false;
-    ultrasonicSensors[ultrasonicCount].targetAnimal = us["animal_type"].as<String>();
-    if (ultrasonicSensors[ultrasonicCount].targetAnimal.length() == 0) {
-      ultrasonicSensors[ultrasonicCount].targetAnimal = "any";
-    }
-    ultrasonicSensors[ultrasonicCount].mouseMaxSpeed = us["mouse_max_speed"] | 100.0;
-    ultrasonicSensors[ultrasonicCount].mouseMaxDuration = us["mouse_max_duration"] | 2000;
-    ultrasonicSensors[ultrasonicCount].catMinDuration = us["cat_min_duration"] | 2000;
-
     // Estado de detección
     ultrasonicSensors[ultrasonicCount].detectionStartTime = 0;
-    ultrasonicSensors[ultrasonicCount].detectedAnimal = "";
     ultrasonicSensors[ultrasonicCount].currentSpeed = 0;
 
     // Configurar pines
@@ -1298,19 +1256,8 @@ void handleCommand(JsonDocument& doc) {
         ultrasonicSensors[ultrasonicCount].distanceBuffer[j] = -1;
       }
 
-      // Parámetros de detección inteligente
-      ultrasonicSensors[ultrasonicCount].smartDetectionEnabled = us["smart_detection_enabled"] | false;
-      ultrasonicSensors[ultrasonicCount].targetAnimal = us["animal_type"].as<String>();
-      if (ultrasonicSensors[ultrasonicCount].targetAnimal.length() == 0) {
-        ultrasonicSensors[ultrasonicCount].targetAnimal = "any";
-      }
-      ultrasonicSensors[ultrasonicCount].mouseMaxSpeed = us["mouse_max_speed"] | 100.0;
-      ultrasonicSensors[ultrasonicCount].mouseMaxDuration = us["mouse_max_duration"] | 2000;
-      ultrasonicSensors[ultrasonicCount].catMinDuration = us["cat_min_duration"] | 2000;
-
       // Estado de detección
       ultrasonicSensors[ultrasonicCount].detectionStartTime = 0;
-      ultrasonicSensors[ultrasonicCount].detectedAnimal = "";
       ultrasonicSensors[ultrasonicCount].currentSpeed = 0;
 
       pinMode(trigPin, OUTPUT);
@@ -1327,6 +1274,109 @@ void handleCommand(JsonDocument& doc) {
     }
 
     Serial.printf("Sensores ultrasónicos actualizados: %d\n", ultrasonicCount);
+  }
+  else if (strcmp(action, "remove_gpio") == 0) {
+    int pin = doc["pin"];
+    for (int i = 0; i < gpioCount; i++) {
+      if (gpios[i].pin == pin) {
+        for (int j = i; j < gpioCount - 1; j++) gpios[j] = gpios[j + 1];
+        gpioCount--;
+        Serial.printf("🗑️ GPIO pin %d eliminado\n", pin);
+        break;
+      }
+    }
+  }
+  else if (strcmp(action, "remove_dht") == 0) {
+    int pin = doc["pin"];
+    for (int i = 0; i < dhtCount; i++) {
+      if (dhtSensors[i].pin == pin) {
+        if (dhtSensors[i].sensor) { delete dhtSensors[i].sensor; dhtSensors[i].sensor = nullptr; }
+        for (int j = i; j < dhtCount - 1; j++) dhtSensors[j] = dhtSensors[j + 1];
+        dhtCount--;
+        Serial.printf("🗑️ DHT pin %d eliminado\n", pin);
+        break;
+      }
+    }
+  }
+  else if (strcmp(action, "remove_i2c") == 0) {
+    int address = doc["i2c_address"];
+    for (int i = 0; i < i2cCount; i++) {
+      if (i2cSensors[i].i2cAddress == address) {
+        if (i2cSensors[i].aht) { delete i2cSensors[i].aht; i2cSensors[i].aht = nullptr; }
+        if (i2cSensors[i].bmp) { delete i2cSensors[i].bmp; i2cSensors[i].bmp = nullptr; }
+        for (int j = i; j < i2cCount - 1; j++) i2cSensors[j] = i2cSensors[j + 1];
+        i2cCount--;
+        Serial.printf("🗑️ Sensor I2C 0x%02X eliminado\n", address);
+        break;
+      }
+    }
+  }
+  else if (strcmp(action, "update_i2c") == 0) {
+    Serial.println("📥 Recibida actualización de I2C");
+
+    // Liberar sensores anteriores
+    for (int i = 0; i < i2cCount; i++) {
+      if (i2cSensors[i].aht) { delete i2cSensors[i].aht; i2cSensors[i].aht = nullptr; }
+      if (i2cSensors[i].bmp) { delete i2cSensors[i].bmp; i2cSensors[i].bmp = nullptr; }
+    }
+    i2cCount = 0;
+
+    JsonArray i2cArray = doc["i2c"].as<JsonArray>();
+    for (JsonObject i2c : i2cArray) {
+      if (i2cCount >= MAX_I2C_SENSORS) break;
+
+      String sensorType = i2c["sensor_type"].as<String>();
+      uint8_t address   = i2c["i2c_address"] | 0x00;
+
+      i2cSensors[i2cCount].id          = i2c["id"];
+      i2cSensors[i2cCount].name        = i2c["name"].as<String>();
+      i2cSensors[i2cCount].sensorType  = sensorType;
+      i2cSensors[i2cCount].i2cAddress  = address;
+      i2cSensors[i2cCount].active      = i2c["active"] | true;
+      i2cSensors[i2cCount].readInterval = i2c["read_interval"] | 5000;
+      i2cSensors[i2cCount].lastRead    = 0;
+      i2cSensors[i2cCount].temperature = 0;
+      i2cSensors[i2cCount].humidity    = 0;
+      i2cSensors[i2cCount].pressure    = 0;
+      i2cSensors[i2cCount].altitude    = 0;
+      i2cSensors[i2cCount].aht         = nullptr;
+      i2cSensors[i2cCount].bmp         = nullptr;
+
+      if (sensorType == "AHT20") {
+        i2cSensors[i2cCount].aht = new Adafruit_AHTX0();
+        if (!i2cSensors[i2cCount].aht->begin(&Wire, 0, address)) {
+          Serial.printf("❌ Error inicializando AHT20 en 0x%02X\n", address);
+          delete i2cSensors[i2cCount].aht;
+          i2cSensors[i2cCount].aht = nullptr;
+          continue;
+        }
+        Serial.printf("✅ AHT20 inicializado en 0x%02X\n", address);
+      }
+      else if (sensorType == "BMP280") {
+        i2cSensors[i2cCount].bmp = new Adafruit_BMP280();
+        if (!i2cSensors[i2cCount].bmp->begin(address)) {
+          Serial.printf("❌ Error inicializando BMP280 en 0x%02X\n", address);
+          delete i2cSensors[i2cCount].bmp;
+          i2cSensors[i2cCount].bmp = nullptr;
+          continue;
+        }
+        i2cSensors[i2cCount].bmp->setSampling(
+          Adafruit_BMP280::MODE_NORMAL,
+          Adafruit_BMP280::SAMPLING_X2,
+          Adafruit_BMP280::SAMPLING_X16,
+          Adafruit_BMP280::FILTER_X16,
+          Adafruit_BMP280::STANDBY_MS_500
+        );
+        Serial.printf("✅ BMP280 inicializado en 0x%02X\n", address);
+      }
+
+      i2cCount++;
+    }
+    Serial.printf("Sensores I2C actualizados: %d\n", i2cCount);
+  }
+  else if (strcmp(action, "scan_i2c") == 0) {
+    Serial.println("🔍 Escaneo I2C solicitado por backend");
+    scanAndReportI2C();
   }
   else if (strcmp(action, "reboot") == 0) {
     Serial.println("🔄 Reiniciando...");
@@ -1455,34 +1505,8 @@ void sendSensorData() {
         u["distance"] = ultrasonicSensors[i].lastDistance;
         u["triggered"] = ultrasonicSensors[i].triggered;
 
-        // Incluir análisis de detección LOCAL (calculado en ESP32)
-        JsonObject analysis = u.createNestedObject("analysis");
-        bool isMoving = isObjectMoving(i);
-        bool inRange = ultrasonicSensors[i].lastDistance <= ultrasonicSensors[i].triggerDistance;
-
-        // detected = true si GPIO está activo O hay movimiento actual en rango
-        analysis["detected"] = ultrasonicSensors[i].triggered || (isMoving && inRange);
-        analysis["speed"] = (int)ultrasonicSensors[i].currentSpeed;
-        analysis["isMoving"] = isMoving;
-
-        // Mostrar el tipo de animal detectado mientras GPIO esté activo
-        if (ultrasonicSensors[i].triggered && ultrasonicSensors[i].detectedAnimal.length() > 0) {
-          analysis["animalType"] = ultrasonicSensors[i].detectedAnimal;
-        } else if (ultrasonicSensors[i].detectedAnimal.length() > 0) {
-          analysis["animalType"] = ultrasonicSensors[i].detectedAnimal;
-        } else {
-          analysis["animalType"] = inRange ? "detecting" : "none";
-        }
-
-        if (ultrasonicSensors[i].detectionStartTime > 0) {
-          analysis["duration"] = (int)(millis() - ultrasonicSensors[i].detectionStartTime);
-        } else {
-          analysis["duration"] = 0;
-        }
-
-        Serial.printf("Ultrasonic[%d] dist:%.1f cm vel:%.1f cm/s animal:%s\n",
-          i, ultrasonicSensors[i].lastDistance, ultrasonicSensors[i].currentSpeed,
-          ultrasonicSensors[i].detectedAnimal.c_str());
+        Serial.printf("Ultrasonic[%d] dist:%.1f cm vel:%.1f cm/s\n",
+          i, ultrasonicSensors[i].lastDistance, ultrasonicSensors[i].currentSpeed);
       }
     }
   }
@@ -1665,66 +1689,6 @@ bool isObjectMoving(int sensorIndex) {
   return speed >= MIN_MOVEMENT_SPEED;
 }
 
-// Clasifica el tipo de animal basado en velocidad y duración
-// Toda la lógica se ejecuta LOCALMENTE en el ESP32
-String classifyAnimal(int sensorIndex) {
-  UltrasonicConfig& sensor = ultrasonicSensors[sensorIndex];
-
-  if (!sensor.smartDetectionEnabled) {
-    return "unknown";
-  }
-
-  float speed = sensor.currentSpeed;
-  unsigned long duration = millis() - sensor.detectionStartTime;
-
-  // Ratón: movimiento rápido y/o duración corta
-  // Los ratones pasan rápido y no se quedan mucho tiempo
-  if (speed <= sensor.mouseMaxSpeed && duration <= sensor.mouseMaxDuration) {
-    return "mouse";
-  }
-
-  // Gato/Perro: permanece más tiempo en el área
-  // Son más lentos y curiosos
-  if (duration >= sensor.catMinDuration) {
-    return "cat";
-  }
-
-  // Aún clasificando (no hay suficientes datos)
-  return "detecting";
-}
-
-// Determina si debe activar el GPIO según el animal detectado y configuración
-bool shouldTriggerForAnimal(int sensorIndex, String detectedAnimal) {
-  UltrasonicConfig& sensor = ultrasonicSensors[sensorIndex];
-
-  // Si detección inteligente está deshabilitada, activar con cualquier movimiento
-  if (!sensor.smartDetectionEnabled) {
-    return true;
-  }
-
-  // No activar si aún está clasificando
-  if (detectedAnimal == "detecting" || detectedAnimal == "unknown") {
-    return false;
-  }
-
-  String target = sensor.targetAnimal;
-
-  if (target == "any") {
-    return detectedAnimal == "cat" || detectedAnimal == "mouse";
-  }
-  if (target == "both") {
-    return detectedAnimal == "cat" || detectedAnimal == "mouse";
-  }
-  if (target == "mouse") {
-    return detectedAnimal == "mouse";
-  }
-  if (target == "cat") {
-    return detectedAnimal == "cat";
-  }
-
-  return false;
-}
-
 void readUltrasonicSensors() {
   for (int i = 0; i < ultrasonicCount; i++) {
     if (!ultrasonicSensors[i].active) continue;
@@ -1758,54 +1722,29 @@ void readUltrasonicSensors() {
         ultrasonicSensors[i].currentSpeed = calculateMovementSpeed(i);
 
         if (objectInRange && objectMoving) {
-          // Objeto en movimiento detectado
-
-          // Iniciar timer de detección si es nuevo
+          // Objeto en movimiento detectado - iniciar timer si es nuevo
           if (ultrasonicSensors[i].detectionStartTime == 0) {
             ultrasonicSensors[i].detectionStartTime = millis();
             Serial.printf("🔍 Objeto en movimiento detectado a %.1f cm\n", distance);
           }
 
-          // Clasificar animal (lógica LOCAL)
-          String animal = classifyAnimal(i);
-          ultrasonicSensors[i].detectedAnimal = animal;
-
-          // Verificar si debe activar trigger
-          if (!ultrasonicSensors[i].triggered && shouldTriggerForAnimal(i, animal)) {
+          // Activar GPIO trigger si corresponde
+          if (!ultrasonicSensors[i].triggered && ultrasonicSensors[i].detectionEnabled) {
             ultrasonicSensors[i].triggered = true;
             ultrasonicSensors[i].triggerStartTime = millis();
 
             if (ultrasonicSensors[i].triggerGpioPin >= 0) {
               digitalWrite(ultrasonicSensors[i].triggerGpioPin,
                           ultrasonicSensors[i].triggerGpioValue);
-
-              if (ultrasonicSensors[i].smartDetectionEnabled) {
-                Serial.printf("🎯 %s detectado a %.1f cm (vel: %.1f cm/s) - GPIO %d activado\n",
-                  animal.c_str(), distance, ultrasonicSensors[i].currentSpeed,
-                  ultrasonicSensors[i].triggerGpioPin);
-              } else {
-                Serial.printf("🎯 Movimiento detectado a %.1f cm (vel: %.1f cm/s) - GPIO %d activado\n",
-                  distance, ultrasonicSensors[i].currentSpeed,
-                  ultrasonicSensors[i].triggerGpioPin);
-              }
-            }
-
-            // Guardar detección offline si no hay conexión WiFi
-            if (WiFi.status() != WL_CONNECTED || !isRegistered) {
-              unsigned long dur = millis() - ultrasonicSensors[i].detectionStartTime;
-              saveOfflineDetection(animal, distance, ultrasonicSensors[i].currentSpeed, dur);
+              Serial.printf("🎯 Movimiento detectado a %.1f cm (vel: %.1f cm/s) - GPIO %d activado\n",
+                distance, ultrasonicSensors[i].currentSpeed,
+                ultrasonicSensors[i].triggerGpioPin);
             }
           }
         }
         else if (!objectInRange) {
           // Objeto salió del rango - resetear detección
-          if (ultrasonicSensors[i].detectionStartTime > 0) {
-            unsigned long duration = millis() - ultrasonicSensors[i].detectionStartTime;
-            Serial.printf("📤 Objeto salió del rango (duración: %lu ms)\n", duration);
-          }
-
           ultrasonicSensors[i].detectionStartTime = 0;
-          ultrasonicSensors[i].detectedAnimal = "";
 
           if (ultrasonicSensors[i].triggered && ultrasonicSensors[i].triggerDuration == 0) {
             ultrasonicSensors[i].triggered = false;
@@ -1817,9 +1756,6 @@ void readUltrasonicSensors() {
           }
         }
         else if (objectInRange && !objectMoving) {
-          // Objeto en rango pero estático
-          // NO resetear mientras GPIO esté activo - el objeto sigue ahí
-          // Solo actualizar velocidad a 0
           ultrasonicSensors[i].currentSpeed = 0;
         }
       }
@@ -1843,119 +1779,6 @@ void processUltrasonicTriggers() {
           ultrasonicSensors[i].triggerGpioPin);
       }
     }
-  }
-}
-
-// ============================================
-// ALMACENAMIENTO OFFLINE (LittleFS)
-// ============================================
-
-void initLittleFS() {
-  Serial.print("💾 Inicializando LittleFS... ");
-
-  if (LittleFS.begin(true)) {  // true = formatear si falla
-    littleFsReady = true;
-    pendingDetections = countPendingDetections();
-    Serial.printf("OK! (%d detecciones pendientes)\n", pendingDetections);
-  } else {
-    littleFsReady = false;
-    Serial.println("ERROR!");
-  }
-}
-
-int countPendingDetections() {
-  if (!littleFsReady) return 0;
-
-  File file = LittleFS.open(DETECTIONS_FILE, "r");
-  if (!file) return 0;
-
-  int count = 0;
-  while (file.available()) {
-    String line = file.readStringUntil('\n');
-    if (line.length() > 5) count++;  // Línea válida
-  }
-  file.close();
-  return count;
-}
-
-void saveOfflineDetection(String animalType, float distance, float speed, unsigned long duration) {
-  if (!littleFsReady) {
-    Serial.println("⚠️ LittleFS no disponible, detección no guardada");
-    return;
-  }
-
-  // Verificar límite de detecciones
-  if (pendingDetections >= MAX_OFFLINE_DETECTIONS) {
-    Serial.println("⚠️ Límite de detecciones offline alcanzado");
-    return;
-  }
-
-  // Crear JSON de la detección
-  StaticJsonDocument<256> doc;
-  doc["ts"] = millis();  // Timestamp relativo (se ajustará al enviar)
-  doc["animal"] = animalType;
-  doc["dist"] = (int)distance;
-  doc["speed"] = (int)speed;
-  doc["dur"] = (int)duration;
-
-  // Guardar en archivo (append)
-  File file = LittleFS.open(DETECTIONS_FILE, "a");
-  if (file) {
-    String json;
-    serializeJson(doc, json);
-    file.println(json);
-    file.close();
-    pendingDetections++;
-    Serial.printf("💾 Detección guardada offline (%d pendientes)\n", pendingDetections);
-    blinkRGB(255, 165, 0);  // Naranja: guardado offline
-  } else {
-    Serial.println("❌ Error al guardar detección");
-  }
-}
-
-void sendPendingDetections() {
-  if (!littleFsReady || pendingDetections == 0) return;
-  if (!isRegistered) return;
-
-  Serial.printf("📤 Enviando %d detecciones pendientes...\n", pendingDetections);
-
-  File file = LittleFS.open(DETECTIONS_FILE, "r");
-  if (!file) return;
-
-  // Crear mensaje con detecciones pendientes
-  StaticJsonDocument<4096> doc;
-  doc["type"] = "offline_detections";
-  doc["mac_address"] = deviceMac;
-  JsonArray detections = doc.createNestedArray("detections");
-
-  int sent = 0;
-  while (file.available() && sent < 50) {  // Enviar máximo 50 por vez
-    String line = file.readStringUntil('\n');
-    if (line.length() < 5) continue;
-
-    StaticJsonDocument<256> det;
-    if (deserializeJson(det, line) == DeserializationError::Ok) {
-      JsonObject obj = detections.createNestedObject();
-      obj["animal"] = det["animal"].as<String>();
-      obj["distance"] = det["dist"].as<int>();
-      obj["speed"] = det["speed"].as<int>();
-      obj["duration"] = det["dur"].as<int>();
-      obj["offline_ts"] = det["ts"].as<unsigned long>();
-      sent++;
-    }
-  }
-  file.close();
-
-  if (sent > 0) {
-    String json;
-    serializeJson(doc, json);
-    webSocket.sendTXT(json);
-    Serial.printf("✅ Enviadas %d detecciones offline\n", sent);
-    blinkRGB(0, 255, 0);  // Verde: enviado
-
-    // Limpiar archivo después de enviar
-    LittleFS.remove(DETECTIONS_FILE);
-    pendingDetections = 0;
   }
 }
 
