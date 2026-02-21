@@ -88,7 +88,6 @@ int BACKEND_PORT = 443;  // Puerto 80 con Nginx, 443 con SSL
 
 // Ahorro de energía - Deep Sleep
 #define DEEP_SLEEP_ENABLED true
-#define DEEP_SLEEP_DURATION 60  // segundos entre lecturas
 #define SENSOR_READ_TIMEOUT 15000  // 15s timeout para leer sensores y enviar
 
 // ============================================
@@ -263,7 +262,8 @@ unsigned long lastTimeSync = 0;
 const unsigned long TIME_SYNC_INTERVAL = 3600000;  // Re-sincronizar cada hora
 
 // Control de Deep Sleep
-bool disableDeepSleep = false;  // Flag para desactivar deep sleep (útil para OTA/debugging)
+bool disableDeepSleep = false;         // Flag para desactivar deep sleep (útil para OTA/debugging)
+unsigned long deepSleepDuration = 60;  // Segundos entre ciclos (configurable desde backend)
 
 unsigned long lastDataSend = 0;
 const unsigned long DATA_SEND_INTERVAL = 5000;
@@ -460,7 +460,7 @@ void loop() {
     if (WiFi.status() != WL_CONNECTED) {
       Serial.println("❌ No se pudo conectar WiFi");
       if (DEEP_SLEEP_ENABLED && !disableDeepSleep) {
-        enterDeepSleep(DEEP_SLEEP_DURATION);
+        enterDeepSleep(deepSleepDuration);
       }
       return;
     }
@@ -527,10 +527,10 @@ void loop() {
 
   // 8. Entrar en Deep Sleep (solo si no está desactivado)
   if (DEEP_SLEEP_ENABLED && !disableDeepSleep) {
-    enterDeepSleep(DEEP_SLEEP_DURATION);
+    enterDeepSleep(deepSleepDuration);
   } else {
     Serial.println("💡 Deep Sleep deshabilitado, esperando...");
-    delay(DEEP_SLEEP_DURATION * 1000);
+    delay(deepSleepDuration * 1000);
     taskCompleted = false;  // Repetir ciclo
   }
 }
@@ -837,6 +837,18 @@ void handleConfig(JsonDocument& doc) {
 
   Serial.print("✅ Registrado como dispositivo ID: ");
   Serial.println(deviceId);
+
+  // Aplicar sleep_interval si el backend lo envía (viene en ms, convertir a segundos)
+  if (doc.containsKey("sleep_interval")) {
+    unsigned long newSleep = doc["sleep_interval"].as<unsigned long>() / 1000;
+    if (newSleep >= 5) {
+      deepSleepDuration = newSleep;
+      preferences.begin("minios", false);
+      preferences.putUInt("sleep_secs", (uint32_t)deepSleepDuration);
+      preferences.end();
+      Serial.printf("⏰ Sleep interval: %lu segundos\n", deepSleepDuration);
+    }
+  }
 
   // Sincronizar hora con el servidor
   if (!timeSync) {
@@ -1452,6 +1464,18 @@ void handleCommand(JsonDocument& doc) {
     Serial.println("🔍 Escaneo I2C solicitado por backend");
     scanAndReportI2C();
   }
+  else if (strcmp(action, "set_sleep_interval") == 0) {
+    unsigned long newSleep = doc["sleep_interval"].as<unsigned long>() / 1000;
+    if (newSleep >= 5) {
+      deepSleepDuration = newSleep;
+      preferences.begin("minios", false);
+      preferences.putUInt("sleep_secs", (uint32_t)deepSleepDuration);
+      preferences.end();
+      Serial.printf("⏰ Sleep interval actualizado a %lu segundos (próximo ciclo)\n", deepSleepDuration);
+    } else {
+      Serial.println("⚠️ Sleep interval mínimo es 5 segundos");
+    }
+  }
   else if (strcmp(action, "reboot") == 0) {
     Serial.println("🔄 Reiniciando...");
     delay(1000);
@@ -1991,6 +2015,7 @@ void loadConfig() {
   String savedPass = preferences.getString("wifi_pass", "");
   String savedHost = preferences.getString("backend_host", "");
   int savedPort = preferences.getInt("backend_port", 0);
+  uint32_t savedSleep = preferences.getUInt("sleep_secs", 0);
 
   // Solo sobrescribir si hay valores guardados
   if (savedSSID.length() > 0) {
@@ -2000,6 +2025,9 @@ void loadConfig() {
   if (savedHost.length() > 0) {
     BACKEND_HOST = savedHost;
     BACKEND_PORT = savedPort;
+  }
+  if (savedSleep >= 5) {
+    deepSleepDuration = savedSleep;
   }
 
   preferences.end();
@@ -2020,6 +2048,7 @@ void saveConfig() {
   preferences.putString("wifi_pass", WIFI_PASS);
   preferences.putString("backend_host", BACKEND_HOST);
   preferences.putInt("backend_port", BACKEND_PORT);
+  preferences.putUInt("sleep_secs", (uint32_t)deepSleepDuration);
 
   preferences.end();
 
