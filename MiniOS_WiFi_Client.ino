@@ -69,13 +69,26 @@
 
 #define FIRMWARE_VERSION "2.0.0"
 
-// WiFi - Configurar aquí o vía Serial
-String WIFI_SSID = "CASA ROJAS";
-String WIFI_PASS = "26ROJASM";
+// Reglas horarias locales en formato POSIX (no IANA: newlib no trae tzdata).
+// Chile continental: UTC-4, con horario de verano UTC-3 desde el primer sabado
+// de septiembre hasta el primer sabado de abril.
+#define POSIX_TZ "<-04>4<-03>,M9.1.6/24,M4.1.6/24"
+
+// WiFi: NO poner las credenciales aqui. Este archivo esta en un repositorio
+// publico y el historial de git conserva para siempre lo que se escriba.
+// Se configuran una vez por el puerto serie y quedan guardadas en NVS:
+//     wifi <ssid> <password>
+String WIFI_SSID = "";
+String WIFI_PASS = "";
 
 // Backend
 String BACKEND_HOST = "minios.iot-robotics.cl";  // Dominio del backend
 int BACKEND_PORT = 443;  // Puerto 80 con Nginx, 443 con SSL
+
+// Token compartido que exige el backend cuando tiene DEVICE_TOKEN configurado.
+// Vacio = no se envia (compatible con un backend que aun no lo exija).
+// Se configura por serie con:  token <valor>
+String DEVICE_TOKEN = "";
 
 // Hardware
 #define MAX_GPIOS 20
@@ -83,7 +96,16 @@ int BACKEND_PORT = 443;  // Puerto 80 con Nginx, 443 con SSL
 #define MAX_ULTRASONIC_SENSORS 4
 #define MAX_I2C_SENSORS 4
 
-#define LED_STATUS 2  // LED integrado
+// LED de estado. Depende de la placa, no solo del chip: la C3 SuperMini lleva
+// un LED azul normal en GPIO 8 que se enciende con nivel BAJO, mientras que el
+// GPIO 2 del define anterior es una entrada ADC y un pin de strapping.
+#if defined(CONFIG_IDF_TARGET_ESP32C3)
+  #define LED_STATUS     8
+  #define LED_ACTIVE_LOW 1
+#else
+  #define LED_STATUS     2
+  #define LED_ACTIVE_LOW 0
+#endif
 #define LED_RGB_COUNT 1
 
 // Ahorro de energía - Deep Sleep
@@ -110,8 +132,11 @@ int BACKEND_PORT = 443;  // Puerto 80 con Nginx, 443 con SSL
   // GPIO 2, 8, 9 son de boot/strapping - usar con precaución
   const int ANALOG_GPIOS[] = {0, 1, 2, 3, 4};  // ADC1_CH0-4
   const int ANALOG_GPIOS_COUNT = 5;
-  const int DIGITAL_GPIOS[] = {5, 6, 7, 10, 18, 19, 20, 21};
-  const int DIGITAL_GPIOS_COUNT = 8;
+  // 18 y 19 fuera: son D-/D+ del USB nativo. En placas como la C3 SuperMini,
+  // que no llevan puente USB-serie, usarlos deja el equipo sin puerto serie.
+  // 20 y 21 son UART0 y quedan libres si se compila con USB CDC On Boot.
+  const int DIGITAL_GPIOS[] = {5, 6, 7, 10, 20, 21};
+  const int DIGITAL_GPIOS_COUNT = 6;
   const int I2C_GPIOS[] = {8, 9};  // SDA=8, SCL=9 (default C3)
   const int I2C_GPIOS_COUNT = 2;
   const int SPI_GPIOS[] = {2, 6, 7, 10};  // MISO, MOSI, SCK, CS
@@ -345,9 +370,9 @@ void setup() {
   Serial.println(BOARD_MODEL);
   Serial.println("========================================");
 
-  // LED de estado
+  // LED de estado (apagado al arrancar)
   pinMode(LED_STATUS, OUTPUT);
-  digitalWrite(LED_STATUS, LOW);
+  ledStatus(false);
 
   // LED RGB NeoPixel (solo si está disponible)
   #if HAS_RGB_LED
@@ -391,6 +416,7 @@ void setup() {
   Serial.println("\nComandos disponibles:");
   Serial.println("  wifi <ssid> <pass> - Configurar WiFi");
   Serial.println("  server <host> <port> - Configurar backend");
+  Serial.println("  token <valor> - Token de dispositivo ('-' para borrar)");
   Serial.println("  status - Ver estado");
   Serial.println("  reboot - Reiniciar");
 
@@ -640,8 +666,20 @@ void blinkRGB(uint8_t r, uint8_t g, uint8_t b, int duration) {
 // WIFI
 // ============================================
 
+// Enciende o apaga el LED de estado respetando la polaridad de la placa
+void ledStatus(bool on) {
+#if LED_ACTIVE_LOW
+  digitalWrite(LED_STATUS, on ? LOW : HIGH);
+#else
+  digitalWrite(LED_STATUS, on ? HIGH : LOW);
+#endif
+}
+
 void connectWiFi() {
-  if (WIFI_SSID.length() == 0) return;
+  if (WIFI_SSID.length() == 0) {
+    Serial.println("⚠️  WiFi sin configurar. Usa: wifi <ssid> <password>");
+    return;
+  }
 
   Serial.print("Conectando a WiFi: ");
   Serial.println(WIFI_SSID);
@@ -665,7 +703,7 @@ void connectWiFi() {
     WiFi.setSleep(WIFI_PS_MIN_MODEM);  // Ahorro moderado, mantiene conexión
     Serial.println("💤 WiFi Sleep Mode habilitado");
 
-    digitalWrite(LED_STATUS, HIGH);
+    ledStatus(true);
 
     // Conectar al backend
     if (BACKEND_HOST.length() > 0) {
@@ -675,7 +713,7 @@ void connectWiFi() {
     }
   } else {
     Serial.println("\n❌ Error conectando WiFi");
-    digitalWrite(LED_STATUS, LOW);
+    ledStatus(false);
   }
 }
 
@@ -689,13 +727,19 @@ void connectWebSocket() {
   Serial.print(":");
   Serial.println(BACKEND_PORT);
 
+  // El backend exige el token si tiene DEVICE_TOKEN configurado
+  String path = "/ws/device";
+  if (DEVICE_TOKEN.length() > 0) {
+    path += "?token=" + DEVICE_TOKEN;
+  }
+
   // Usar SSL para puerto 443, sin SSL para otros puertos
   if (BACKEND_PORT == 443) {
     Serial.println("Usando conexión SSL (wss://)");
-    webSocket.beginSSL(BACKEND_HOST.c_str(), BACKEND_PORT, "/ws/device");
+    webSocket.beginSSL(BACKEND_HOST.c_str(), BACKEND_PORT, path.c_str());
   } else {
     Serial.println("Usando conexión sin SSL (ws://)");
-    webSocket.begin(BACKEND_HOST.c_str(), BACKEND_PORT, "/ws/device");
+    webSocket.begin(BACKEND_HOST.c_str(), BACKEND_PORT, path.c_str());
   }
 
   webSocket.onEvent(webSocketEvent);
@@ -777,13 +821,13 @@ void syncTimeWithBackend() {
         serverTimezone = String(timezone);
       }
 
-      // Configurar hora del sistema ESP32 con timezone de Chile
-      // Chile: UTC-3 (verano feb-mar, sep-nov) o UTC-4 (invierno abr-ago)
-      // Usamos UTC-3 como default (horario de verano)
-      long gmtOffset_sec = -3 * 3600;  // -3 horas en segundos
-      int daylightOffset_sec = 0;       // Sin DST adicional
-
-      configTime(gmtOffset_sec, daylightOffset_sec, "pool.ntp.org");
+      // El reloj se mantiene en UTC y la conversion a hora local se hace con
+      // reglas POSIX. Antes habia un desfase fijo de -3 h, asi que medio ano
+      // (abril-agosto, cuando Chile esta en UTC-4) la hora salia corrida.
+      // newlib no trae la base de datos IANA, de modo que el nombre que envia
+      // el backend no se puede usar directamente: se guarda solo para mostrarlo.
+      setenv("TZ", POSIX_TZ, 1);
+      tzset();
 
       // Establecer la hora directamente desde el timestamp del servidor (UTC)
       struct timeval tv;
@@ -952,6 +996,13 @@ void handleConfig(JsonDocument& doc) {
     int pin = dht["pin"];
     String type = dht["sensor_type"].as<String>();
 
+    // Los GPIO si se validaban, pero los DHT no: un pin de la flash interna
+    // llegado del backend acababa en pinMode() y colgaba el chip.
+    if (!GPIO_IsValid(pin) || !GPIO_IsAppropriate(pin, MODE_OUTPUT)) {
+      Serial.printf("[DHT] Pin %d no es válido para un sensor DHT\n", pin);
+      continue;
+    }
+
     dhtSensors[dhtCount].pin = pin;
     dhtSensors[dhtCount].name = dht["name"].as<String>();
     dhtSensors[dhtCount].type = type;
@@ -1082,6 +1133,23 @@ void handleConfig(JsonDocument& doc) {
     int trigPin = us["trig_pin"];
     int echoPin = us["echo_pin"];
 
+    // Mismo caso que los DHT: trig, echo y el GPIO de disparo iban directos a
+    // pinMode() sin comprobar nada
+    if (!GPIO_IsValid(trigPin) || !GPIO_IsAppropriate(trigPin, MODE_OUTPUT)) {
+      Serial.printf("[US] trig_pin %d no es válido\n", trigPin);
+      continue;
+    }
+    if (!GPIO_IsValid(echoPin) || !GPIO_IsAppropriate(echoPin, MODE_INPUT)) {
+      Serial.printf("[US] echo_pin %d no es válido\n", echoPin);
+      continue;
+    }
+
+    int trigGpio = us["trigger_gpio_pin"] | -1;
+    if (trigGpio >= 0 && (!GPIO_IsValid(trigGpio) || !GPIO_IsAppropriate(trigGpio, MODE_OUTPUT))) {
+      Serial.printf("[US] trigger_gpio_pin %d no es válido, se ignora\n", trigGpio);
+      trigGpio = -1;
+    }
+
     ultrasonicSensors[ultrasonicCount].id = us["id"];
     ultrasonicSensors[ultrasonicCount].trigPin = trigPin;
     ultrasonicSensors[ultrasonicCount].echoPin = echoPin;
@@ -1089,7 +1157,7 @@ void handleConfig(JsonDocument& doc) {
     ultrasonicSensors[ultrasonicCount].maxDistance = us["max_distance"] | 400;
     ultrasonicSensors[ultrasonicCount].detectionEnabled = us["detection_enabled"] | true;
     ultrasonicSensors[ultrasonicCount].triggerDistance = us["trigger_distance"] | 50;
-    ultrasonicSensors[ultrasonicCount].triggerGpioPin = us["trigger_gpio_pin"] | -1;
+    ultrasonicSensors[ultrasonicCount].triggerGpioPin = trigGpio;
     ultrasonicSensors[ultrasonicCount].triggerGpioValue = us["trigger_gpio_value"] | 1;
     ultrasonicSensors[ultrasonicCount].triggerDuration = us["trigger_duration"] | 1000;
     ultrasonicSensors[ultrasonicCount].active = us["active"] | true;
@@ -1927,8 +1995,16 @@ void startOTA(int id, String filename, int filesize, String checksum) {
   otaFilesize = filesize;
   otaChecksum = checksum;
 
-  // Descargar firmware
-  String url = "http://" + BACKEND_HOST + ":" + String(BACKEND_PORT) + "/api/ota/download/" + filename;
+  // Descargar firmware.
+  // El esquema iba fijo a http:// aunque BACKEND_PORT fuera 443, asi que con SSL
+  // la descarga fallaba siempre. syncTimeWithBackend() ya lo hacia bien.
+  String url = String("http") + (BACKEND_PORT == 443 ? "s" : "") + "://" +
+               BACKEND_HOST + ":" + String(BACKEND_PORT) +
+               "/api/ota/download/" + filename;
+
+  if (DEVICE_TOKEN.length() > 0) {
+    url += "?token=" + DEVICE_TOKEN;
+  }
 
   HTTPClient http;
   http.begin(url);
@@ -1943,21 +2019,41 @@ void startOTA(int id, String filename, int filesize, String checksum) {
       bool canBegin = Update.begin(contentLength);
 
       if (canBegin) {
+        // El backend manda el MD5 del binario y hasta ahora se guardaba sin
+        // comprobarlo: se grababa cualquier cosa que llegara por la red.
+        if (otaChecksum.length() > 0) {
+          if (!Update.setMD5(otaChecksum.c_str())) {
+            Serial.println("❌ Checksum con formato inválido");
+            Update.abort();
+            reportOTAStatus("failed", "Invalid checksum format");
+            http.end();
+            otaInProgress = false;
+            return;
+          }
+        } else {
+          Serial.println("⚠️  El backend no envió checksum: no se puede verificar");
+        }
+
         Serial.println("Descargando firmware...");
 
         WiFiClient* stream = http.getStreamPtr();
         size_t written = Update.writeStream(*stream);
 
-        if (written == contentLength) {
-          Serial.println("Firmware descargado correctamente");
-        } else {
-          Serial.print("Error: solo se escribieron ");
-          Serial.print(written);
-          Serial.print(" de ");
-          Serial.println(contentLength);
+        // Antes se avisaba del descuadre y se continuaba igualmente a Update.end()
+        if (written != (size_t)contentLength) {
+          Serial.printf("❌ Descarga incompleta: %u de %d bytes\n",
+                        (unsigned)written, contentLength);
+          Update.abort();
+          reportOTAStatus("failed", "Incomplete download");
+          http.end();
+          otaInProgress = false;
+          return;
         }
 
-        if (Update.end()) {
+        Serial.println("Firmware descargado correctamente");
+
+        // Update.end() valida aqui el MD5 fijado arriba
+        if (Update.end(true)) {
           if (Update.isFinished()) {
             Serial.println("✅ OTA completado exitosamente");
             reportOTAStatus("success", "");
@@ -2014,6 +2110,7 @@ void loadConfig() {
   String savedSSID = preferences.getString("wifi_ssid", "");
   String savedPass = preferences.getString("wifi_pass", "");
   String savedHost = preferences.getString("backend_host", "");
+  String savedToken = preferences.getString("device_token", "");
   int savedPort = preferences.getInt("backend_port", 0);
   uint32_t savedSleep = preferences.getUInt("sleep_secs", 0);
 
@@ -2025,6 +2122,9 @@ void loadConfig() {
   if (savedHost.length() > 0) {
     BACKEND_HOST = savedHost;
     BACKEND_PORT = savedPort;
+  }
+  if (savedToken.length() > 0) {
+    DEVICE_TOKEN = savedToken;
   }
   if (savedSleep >= 5) {
     deepSleepDuration = savedSleep;
@@ -2039,6 +2139,8 @@ void loadConfig() {
   Serial.print(BACKEND_HOST);
   Serial.print(":");
   Serial.println(BACKEND_PORT);
+  Serial.print("Token de dispositivo: ");
+  Serial.println(DEVICE_TOKEN.length() > 0 ? "configurado" : "(ninguno)");
 }
 
 void saveConfig() {
@@ -2047,6 +2149,7 @@ void saveConfig() {
   preferences.putString("wifi_ssid", WIFI_SSID);
   preferences.putString("wifi_pass", WIFI_PASS);
   preferences.putString("backend_host", BACKEND_HOST);
+  preferences.putString("device_token", DEVICE_TOKEN);
   preferences.putInt("backend_port", BACKEND_PORT);
   preferences.putUInt("sleep_secs", (uint32_t)deepSleepDuration);
 
@@ -2097,6 +2200,20 @@ void handleSerial() {
       Serial.println("Uso: server <host> <port>");
     }
   }
+  else if (cmd == "token") {
+    if (args.length() > 0) {
+      DEVICE_TOKEN = (args == "-") ? "" : args;
+      saveConfig();
+      Serial.println(DEVICE_TOKEN.length() > 0
+                     ? "✅ Token guardado"
+                     : "✅ Token borrado");
+      if (WiFi.status() == WL_CONNECTED) {
+        connectWebSocket();
+      }
+    } else {
+      Serial.println("Uso: token <valor>   (usa '-' para borrarlo)");
+    }
+  }
   else if (cmd == "status") {
     Serial.println("\n--- Estado ---");
     Serial.print("MAC: ");
@@ -2109,6 +2226,8 @@ void handleSerial() {
     Serial.print(BACKEND_HOST);
     Serial.print(":");
     Serial.println(BACKEND_PORT);
+    Serial.print("Token: ");
+    Serial.println(DEVICE_TOKEN.length() > 0 ? "configurado" : "(ninguno)");
     Serial.print("Registrado: ");
     Serial.println(isRegistered ? "Sí" : "No");
     Serial.print("GPIOs: ");

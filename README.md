@@ -13,13 +13,43 @@ Firmware ligero para ESP32 que se conecta al backend centralizado MiniOS.
 
 ## Librerías Requeridas
 
-Instalar desde el Library Manager de Arduino IDE:
+Instalar desde el Library Manager del IDE (o con `arduino-cli lib install`):
 
-1. **WebSockets** by Markus Sattler (v2.4.0+)
-2. **ArduinoJson** by Benoit Blanchon (v6.21.0+)
-3. **DHT sensor library** by Adafruit (v1.4.4+)
+1. **WebSockets** — Markus Sattler (probado con 2.7.2)
+2. **ArduinoJson** — Benoit Blanchon (probado con 7.4.3; el código usa la API v6,
+   que sigue funcionando en v7 aunque avise de obsolescencia)
+3. **DHT sensor library** — Adafruit (1.4.7) + **Adafruit Unified Sensor**
+4. **Adafruit AHTX0** (2.0.6)
+5. **Adafruit BMP280 Library** (3.0.0)
+6. **Adafruit BME280 Library** (2.3.0)
+7. **Adafruit NeoPixel** (1.15.5) — solo se usa en ESP32 y ESP32-S3
+
+## Opciones de compilación
+
+El firmware **no cabe** con el esquema de particiones por defecto: hay que
+elegir uno con más espacio de aplicación que conserve las dos particiones OTA.
+
+| Opción del IDE | Valor |
+|----------------|-------|
+| Partition Scheme | **Minimal SPIFFS (1.9MB APP with OTA)** |
+| USB CDC On Boot | **Enabled** (si no, los logs salen por UART0 y no por el USB) |
+
+Con `arduino-cli`:
+
+```bash
+arduino-cli compile \
+  --fqbn esp32:esp32:esp32c3:CDCOnBoot=cdc,PartitionScheme=min_spiffs \
+  MiniOS_WiFi_Client
+```
+
+Tamaños verificados: **ESP32-C3 1,32 MB (67%)** · **ESP32-S3 1,21 MB (61%)**.
 
 ## Configuración Inicial
+
+> **Las credenciales no van en el código.** El archivo `.ino` está en un
+> repositorio público y el historial de git conserva para siempre lo que se
+> escriba en él. `WIFI_SSID` y `WIFI_PASS` se dejan vacíos y se configuran por
+> el puerto serie: quedan guardados en NVS y sobreviven a los reinicios.
 
 ### Via Serial (115200 baud)
 
@@ -43,7 +73,13 @@ server mi-servidor.com 3000
 status
 ```
 
-4. Reiniciar:
+4. Token de dispositivo (solo si el backend tiene `DEVICE_TOKEN` configurado):
+```
+token el-token-del-servidor
+```
+Se envía en la URL del WebSocket y en las descargas OTA. Con `token -` se borra.
+
+5. Reiniciar:
 ```
 reboot
 ```
