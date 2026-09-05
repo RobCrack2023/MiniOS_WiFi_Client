@@ -296,7 +296,7 @@ const unsigned long TIME_SYNC_INTERVAL = 3600000;  // Re-sincronizar cada hora
 
 // Control de Deep Sleep
 bool disableDeepSleep = false;         // Flag para desactivar deep sleep (útil para OTA/debugging)
-int wifiFailCount = 0;                 // Fallos de conexión WiFi consecutivos
+int wifiFailedCycles = 0;              // Rondas completas de intentos fallidas
 unsigned long deepSleepDuration = 60;  // Segundos entre ciclos (configurable desde backend)
 
 unsigned long lastDataSend = 0;
@@ -492,11 +492,15 @@ void loop() {
 
   // 2. Verificar WiFi
   if (WiFi.status() != WL_CONNECTED) {
-    Serial.println("❌ Sin WiFi, reintentando...");
-    connectWiFi();
+    // Si ya falló una ronda completa en este arranque (por ejemplo en setup),
+    // no se repiten otros 30 s a ciegas: se pregunta directamente.
+    if (wifiFailedCycles == 0) {
+      Serial.println("❌ Sin WiFi, reintentando...");
+      connectWiFi();
+    }
 
-    // Agotados los intentos, pedir credenciales en vez de seguir a ciegas
-    if (WiFi.status() != WL_CONNECTED && wifiFailCount >= WIFI_MAX_ATTEMPTS) {
+    // connectWiFi() ya agotó sus WIFI_MAX_ATTEMPTS intentos: toca preguntar
+    if (WiFi.status() != WL_CONNECTED) {
       waitForWifiCredentials();
     }
 
@@ -705,27 +709,49 @@ void ledStatus(bool on) {
 #endif
 }
 
+// Un unico intento de conexion, con espera acotada
+static bool connectWiFiAttempt() {
+  // Sin esto el ESP32 responde "sta is connecting, cannot set config" y se
+  // queda probando con las credenciales ANTERIORES: begin() no aplica nada
+  // mientras haya una conexion en curso.
+  WiFi.disconnect(false, false);
+  delay(200);
+
+  WiFi.mode(WIFI_STA);
+  WiFi.begin(WIFI_SSID.c_str(), WIFI_PASS.c_str());
+
+  int ticks = 0;
+  while (WiFi.status() != WL_CONNECTED && ticks < 20) {  // 10 s
+    delay(500);
+    Serial.print(".");
+    ticks++;
+  }
+
+  return WiFi.status() == WL_CONNECTED;
+}
+
 void connectWiFi() {
   if (WIFI_SSID.length() == 0) {
     Serial.println("⚠️  WiFi sin configurar. Usa: wifi <ssid> <password>");
     return;
   }
 
-  Serial.print("Conectando a WiFi: ");
-  Serial.println(WIFI_SSID);
+  // Los intentos van seguidos aqui dentro. Antes se contaba uno por ciclo del
+  // loop, asi que al escribir credenciales nuevas solo se probaba una vez.
+  for (int attempt = 1; attempt <= WIFI_MAX_ATTEMPTS; attempt++) {
+    Serial.printf("Conectando a WiFi: %s (intento %d de %d)\n",
+                  WIFI_SSID.c_str(), attempt, WIFI_MAX_ATTEMPTS);
 
-  WiFi.mode(WIFI_STA);
-  WiFi.begin(WIFI_SSID.c_str(), WIFI_PASS.c_str());
+    if (connectWiFiAttempt()) break;
 
-  int attempts = 0;
-  while (WiFi.status() != WL_CONNECTED && attempts < 20) {
-    delay(500);
-    Serial.print(".");
-    attempts++;
+    Serial.printf("\n   Intento %d fallido: %s\n",
+                  attempt, wifiStatusText(WiFi.status()));
+
+    if (attempt < WIFI_MAX_ATTEMPTS) delay(1000);
   }
 
   if (WiFi.status() == WL_CONNECTED) {
-    wifiFailCount = 0;
+    wifiFailedCycles = 0;
     Serial.println("\n✅ WiFi conectado");
     Serial.print("IP: ");
     Serial.println(WiFi.localIP());
@@ -743,9 +769,9 @@ void connectWiFi() {
       Serial.println("⚠️  Backend no configurado. Usa: server <host> <port>");
     }
   } else {
-    wifiFailCount++;
-    Serial.printf("\n❌ Error conectando WiFi (intento %d de %d): %s\n",
-                  wifiFailCount, WIFI_MAX_ATTEMPTS, wifiStatusText(WiFi.status()));
+    wifiFailedCycles++;
+    Serial.printf("❌ No se pudo conectar tras %d intentos: %s\n",
+                  WIFI_MAX_ATTEMPTS, wifiStatusText(WiFi.status()));
     ledStatus(false);
   }
 }
@@ -753,9 +779,10 @@ void connectWiFi() {
 // Tras WIFI_MAX_ATTEMPTS fallos se deja de reintentar a ciegas y se pide que
 // escribas credenciales nuevas. Antes el loop volvia a llamar a connectWiFi()
 // sin parar y sus 10 s de bloqueo no dejaban hueco para teclear nada.
-void waitForWifiCredentials() {
+// Escanea y dice cual de los dos datos hay que revisar
+static void diagnoseWifi() {
   Serial.println("\n========================================");
-  Serial.printf("⚠️  %d intentos fallidos con SSID \"%s\"\n", wifiFailCount, WIFI_SSID.c_str());
+  Serial.printf("⚠️  No se pudo conectar a \"%s\"\n", WIFI_SSID.c_str());
 
   // Diagnostico: mirar si la red siquiera esta al alcance
   Serial.println("🔍 Buscando redes cercanas...");
@@ -784,25 +811,35 @@ void waitForWifiCredentials() {
   Serial.println("   wifi <ssid> <password>");
   Serial.println("   wifi \"CASA ROJAS\" miclave     (si el nombre lleva espacios)");
   Serial.println("========================================\n");
+}
 
+void waitForWifiCredentials() {
   unsigned long start = millis();
-  unsigned long lastReminder = millis();
 
   while (WiFi.status() != WL_CONNECTED) {
-    handleSerial();
-    delay(50);
+    diagnoseWifi();
 
-    // Con Deep Sleep activo no se puede esperar indefinidamente: el equipo
-    // puede ir a bateria y la red quizas solo este caida un rato.
-    if (DEEP_SLEEP_ENABLED && !disableDeepSleep && millis() - start > WIFI_CONFIG_WINDOW_MS) {
-      Serial.println("⏱️  Nadie respondió: se vuelve a dormir y se reintentará al despertar");
-      wifiFailCount = 0;  // ciclo nuevo tras el sueño
-      return;
-    }
+    // Si el usuario teclea unas credenciales, handleSerial() llama a
+    // connectWiFi(), que hace su ronda de intentos e incrementa el contador
+    // al fallar: eso nos saca de esta espera para volver a diagnosticar.
+    int cyclesBefore = wifiFailedCycles;
+    unsigned long lastReminder = millis();
 
-    if (millis() - lastReminder > 30000) {
-      lastReminder = millis();
-      Serial.println("⌛ Esperando:  wifi <ssid> <password>");
+    while (WiFi.status() != WL_CONNECTED && wifiFailedCycles == cyclesBefore) {
+      handleSerial();
+      delay(50);
+
+      // Con Deep Sleep activo no se puede esperar indefinidamente: el equipo
+      // puede ir a bateria y la red quizas solo este caida un rato.
+      if (DEEP_SLEEP_ENABLED && !disableDeepSleep && millis() - start > WIFI_CONFIG_WINDOW_MS) {
+        Serial.println("⏱️  Nadie respondió: se vuelve a dormir y se reintentará al despertar");
+        return;
+      }
+
+      if (millis() - lastReminder > 30000) {
+        lastReminder = millis();
+        Serial.println("⌛ Esperando:  wifi <ssid> <password>");
+      }
     }
   }
 }
@@ -2304,7 +2341,6 @@ void handleSerial() {
       Serial.println(" caracteres");
 
       saveConfig();
-      wifiFailCount = 0;  // credenciales nuevas: se empieza a contar de cero
       connectWiFi();
     } else {
       Serial.println("Uso: wifi <ssid> <password>");
