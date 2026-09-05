@@ -108,6 +108,14 @@ String DEVICE_TOKEN = "";
 #endif
 #define LED_RGB_COUNT 1
 
+// Intentos de conexion WiFi antes de pedir credenciales nuevas
+#define WIFI_MAX_ATTEMPTS 3
+
+// Cuanto se espera a que escribas credenciales antes de volver a dormir.
+// Solo aplica con Deep Sleep activo: si esta desactivado se espera sin limite,
+// porque se asume que hay alguien delante del monitor serie.
+#define WIFI_CONFIG_WINDOW_MS 300000  // 5 minutos
+
 // Ahorro de energía - Deep Sleep
 #define DEEP_SLEEP_ENABLED true
 #define SENSOR_READ_TIMEOUT 15000  // 15s timeout para leer sensores y enviar
@@ -288,6 +296,7 @@ const unsigned long TIME_SYNC_INTERVAL = 3600000;  // Re-sincronizar cada hora
 
 // Control de Deep Sleep
 bool disableDeepSleep = false;         // Flag para desactivar deep sleep (útil para OTA/debugging)
+int wifiFailCount = 0;                 // Fallos de conexión WiFi consecutivos
 unsigned long deepSleepDuration = 60;  // Segundos entre ciclos (configurable desde backend)
 
 unsigned long lastDataSend = 0;
@@ -308,6 +317,8 @@ String otaChecksum = "";
 // ============================================
 
 void connectWiFi();
+void waitForWifiCredentials();
+const char* wifiStatusText(wl_status_t status);
 void connectWebSocket();
 void webSocketEvent(WStype_t type, uint8_t* payload, size_t length);
 void registerDevice();
@@ -483,6 +494,11 @@ void loop() {
   if (WiFi.status() != WL_CONNECTED) {
     Serial.println("❌ Sin WiFi, reintentando...");
     connectWiFi();
+
+    // Agotados los intentos, pedir credenciales en vez de seguir a ciegas
+    if (WiFi.status() != WL_CONNECTED && wifiFailCount >= WIFI_MAX_ATTEMPTS) {
+      waitForWifiCredentials();
+    }
 
     if (WiFi.status() != WL_CONNECTED) {
       Serial.println("❌ No se pudo conectar WiFi");
@@ -667,6 +683,19 @@ void blinkRGB(uint8_t r, uint8_t g, uint8_t b, int duration) {
 // WIFI
 // ============================================
 
+// Traduce el codigo de estado del WiFi a algo accionable: distingue "no veo esa
+// red" (nombre mal escrito o fuera de alcance) de "la red me rechaza" (clave mal)
+const char* wifiStatusText(wl_status_t status) {
+  switch (status) {
+    case WL_NO_SSID_AVAIL:   return "no se encuentra esa red (¿nombre mal escrito o fuera de alcance?)";
+    case WL_CONNECT_FAILED:  return "la red rechazó la conexión (¿contraseña incorrecta?)";
+    case WL_CONNECTION_LOST: return "conexión perdida";
+    case WL_DISCONNECTED:    return "desconectado";
+    case WL_IDLE_STATUS:     return "sin respuesta del punto de acceso";
+    default:                 return "error desconocido";
+  }
+}
+
 // Enciende o apaga el LED de estado respetando la polaridad de la placa
 void ledStatus(bool on) {
 #if LED_ACTIVE_LOW
@@ -696,6 +725,7 @@ void connectWiFi() {
   }
 
   if (WiFi.status() == WL_CONNECTED) {
+    wifiFailCount = 0;
     Serial.println("\n✅ WiFi conectado");
     Serial.print("IP: ");
     Serial.println(WiFi.localIP());
@@ -713,8 +743,67 @@ void connectWiFi() {
       Serial.println("⚠️  Backend no configurado. Usa: server <host> <port>");
     }
   } else {
-    Serial.println("\n❌ Error conectando WiFi");
+    wifiFailCount++;
+    Serial.printf("\n❌ Error conectando WiFi (intento %d de %d): %s\n",
+                  wifiFailCount, WIFI_MAX_ATTEMPTS, wifiStatusText(WiFi.status()));
     ledStatus(false);
+  }
+}
+
+// Tras WIFI_MAX_ATTEMPTS fallos se deja de reintentar a ciegas y se pide que
+// escribas credenciales nuevas. Antes el loop volvia a llamar a connectWiFi()
+// sin parar y sus 10 s de bloqueo no dejaban hueco para teclear nada.
+void waitForWifiCredentials() {
+  Serial.println("\n========================================");
+  Serial.printf("⚠️  %d intentos fallidos con SSID \"%s\"\n", wifiFailCount, WIFI_SSID.c_str());
+
+  // Diagnostico: mirar si la red siquiera esta al alcance
+  Serial.println("🔍 Buscando redes cercanas...");
+  int n = WiFi.scanNetworks();
+  bool found = false;
+
+  for (int i = 0; i < n; i++) {
+    if (WiFi.SSID(i) == WIFI_SSID) {
+      found = true;
+      Serial.printf("   La red existe (señal %d dBm) → revisa la CONTRASEÑA\n", WiFi.RSSI(i));
+      break;
+    }
+  }
+
+  if (!found) {
+    Serial.println("   Esa red NO aparece → revisa el NOMBRE. Redes visibles:");
+    for (int i = 0; i < n && i < 12; i++) {
+      Serial.printf("     [%s]  %d dBm\n", WiFi.SSID(i).c_str(), WiFi.RSSI(i));
+    }
+    if (n == 0) Serial.println("     (ninguna)");
+  }
+
+  WiFi.scanDelete();
+
+  Serial.println("\nEscribe las credenciales correctas:");
+  Serial.println("   wifi <ssid> <password>");
+  Serial.println("   wifi \"CASA ROJAS\" miclave     (si el nombre lleva espacios)");
+  Serial.println("========================================\n");
+
+  unsigned long start = millis();
+  unsigned long lastReminder = millis();
+
+  while (WiFi.status() != WL_CONNECTED) {
+    handleSerial();
+    delay(50);
+
+    // Con Deep Sleep activo no se puede esperar indefinidamente: el equipo
+    // puede ir a bateria y la red quizas solo este caida un rato.
+    if (DEEP_SLEEP_ENABLED && !disableDeepSleep && millis() - start > WIFI_CONFIG_WINDOW_MS) {
+      Serial.println("⏱️  Nadie respondió: se vuelve a dormir y se reintentará al despertar");
+      wifiFailCount = 0;  // ciclo nuevo tras el sueño
+      return;
+    }
+
+    if (millis() - lastReminder > 30000) {
+      lastReminder = millis();
+      Serial.println("⌛ Esperando:  wifi <ssid> <password>");
+    }
   }
 }
 
@@ -2215,6 +2304,7 @@ void handleSerial() {
       Serial.println(" caracteres");
 
       saveConfig();
+      wifiFailCount = 0;  // credenciales nuevas: se empieza a contar de cero
       connectWiFi();
     } else {
       Serial.println("Uso: wifi <ssid> <password>");
