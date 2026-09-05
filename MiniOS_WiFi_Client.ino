@@ -415,6 +415,7 @@ void setup() {
   // Mostrar comandos disponibles
   Serial.println("\nComandos disponibles:");
   Serial.println("  wifi <ssid> <pass> - Configurar WiFi");
+  Serial.println("     SSID con espacios: wifi \"CASA ROJAS\" miclave");
   Serial.println("  server <host> <port> - Configurar backend");
   Serial.println("  token <valor> - Token de dispositivo ('-' para borrar)");
   Serial.println("  status - Ver estado");
@@ -2176,14 +2177,50 @@ void handleSerial() {
   String args = (space1 > 0) ? input.substring(space1 + 1) : "";
 
   if (cmd == "wifi") {
-    int space2 = args.indexOf(' ');
-    if (space2 > 0) {
-      WIFI_SSID = args.substring(0, space2);
-      WIFI_PASS = args.substring(space2 + 1);
+    // El corte se hacia por el PRIMER espacio, asi que un SSID como
+    // "CASA ROJAS" se partia en SSID="CASA" y contrasena="ROJAS <clave>".
+    // Ahora: con comillas se delimita el SSID; sin ellas se corta por el
+    // ULTIMO espacio, de modo que el SSID puede llevar espacios.
+    String ssid = "";
+    String pass = "";
+    bool ok = false;
+
+    if (args.startsWith("\"")) {
+      int endQuote = args.indexOf('"', 1);
+      if (endQuote > 1) {
+        ssid = args.substring(1, endQuote);
+        pass = args.substring(endQuote + 1);
+        pass.trim();
+        ok = true;
+      }
+    } else {
+      int lastSpace = args.lastIndexOf(' ');
+      if (lastSpace > 0) {
+        ssid = args.substring(0, lastSpace);
+        pass = args.substring(lastSpace + 1);
+        ssid.trim();
+        ok = true;
+      }
+    }
+
+    if (ok && ssid.length() > 0 && pass.length() > 0) {
+      WIFI_SSID = ssid;
+      WIFI_PASS = pass;
+
+      // Eco para poder verificar el corte sin exponer la contrasena
+      Serial.print("SSID: [");
+      Serial.print(WIFI_SSID);
+      Serial.print("]  contraseña: ");
+      Serial.print(WIFI_PASS.length());
+      Serial.println(" caracteres");
+
       saveConfig();
       connectWiFi();
     } else {
       Serial.println("Uso: wifi <ssid> <password>");
+      Serial.println("  Si el SSID lleva espacios, entre comillas:");
+      Serial.println("  wifi \"CASA ROJAS\" miclave");
+      Serial.println("  (sin comillas se toma como contraseña lo que va tras el último espacio)");
     }
   }
   else if (cmd == "server") {
