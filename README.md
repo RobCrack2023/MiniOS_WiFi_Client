@@ -89,9 +89,45 @@ reboot
 1. El ESP32 se conecta al WiFi configurado
 2. Establece conexión WebSocket con el backend
 3. Se registra automáticamente usando su MAC Address
-4. Recibe configuraciones (GPIO, DHT) del backend
+4. Recibe configuraciones (GPIO, DHT, micrófono) del backend
 5. Envía datos de sensores cada 5 segundos
 6. Ejecuta comandos recibidos (set GPIO, reiniciar, OTA)
+
+## Micrófono I2S (INMP441)
+
+El dispositivo puede grabar audio cada cierto tiempo y subirlo al backend, donde
+se escucha desde el dashboard (pestaña **Audio** del dispositivo).
+
+### Conexión (ESP32-C3 SuperMini)
+
+| INMP441 | Pin |
+|---------|-----|
+| VDD | 3.3 (nunca 5 V) |
+| GND | G |
+| SCK | GPIO 6 |
+| WS | GPIO 7 |
+| SD | GPIO 5 |
+| L/R | G (canal izquierdo) · 3.3 para el derecho |
+
+Los pines se configuran desde el dashboard; esos son los que vienen por defecto.
+Un segundo micrófono comparte SCK, WS y SD con el primero: solo cambia el L/R.
+
+### Funcionamiento
+
+- La grabación ocurre durante la ventana en que el dispositivo está despierto,
+  justo después de enviar los sensores. Mientras duerme no graba.
+- El audio se sube **mientras se graba** (PCM de 16 bits a `/api/audio/upload`),
+  así que nunca ocupa la RAM entera: 10 s a 16 kHz son 320 KB, más de lo que le
+  queda libre a la C3.
+- "Grabar cada" se mide con el reloj, que se conserva durante el deep sleep. El
+  intervalo real nunca es menor que el del deep sleep.
+- "Grabar ahora" desde el dashboard graba en la ventana de comandos actual, o
+  al próximo despertar si el dispositivo está dormido.
+- Si la subida falla, se vuelve a intentar en el siguiente ciclo.
+
+Para probar el micrófono por separado, sin backend, está el sketch
+[`tests/INMP441_Test`](tests/INMP441_Test/INMP441_Test.ino): muestra el nivel en
+dB en el Serial Plotter.
 
 ## Actualizaciones OTA
 

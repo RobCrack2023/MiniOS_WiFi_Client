@@ -24,6 +24,7 @@
 #include <Adafruit_AHTX0.h>
 #include <Adafruit_BMP280.h>
 #include <Adafruit_BME280.h>
+#include <ESP_I2S.h>
 
 // Incluir NeoPixel solo si el board lo soporta
 #if defined(CONFIG_IDF_TARGET_ESP32S3) || defined(CONFIG_IDF_TARGET_ESP32)
@@ -67,7 +68,7 @@
 // CONFIGURACIÓN
 // ============================================
 
-#define FIRMWARE_VERSION "2.0.0"
+#define FIRMWARE_VERSION "2.1.0"
 
 // Reglas horarias locales en formato POSIX (no IANA: newlib no trae tzdata).
 // Chile continental: UTC-4, con horario de verano UTC-3 desde el primer sabado
@@ -260,6 +261,19 @@ struct UltrasonicConfig {
   float currentSpeed;
 };
 
+// Micrófono I2S (INMP441). Uno por dispositivo.
+struct AudioConfig {
+  bool enabled;
+  int sckPin;
+  int wsPin;
+  int sdPin;
+  int channel;            // 0 = izquierdo (L/R a GND), 1 = derecho (L/R a 3V3)
+  uint32_t sampleRate;    // 8000 o 16000 Hz
+  uint16_t durationSec;   // Duración de cada grabación
+  uint32_t intervalSec;   // Cada cuánto se graba (0 = en cada ciclo)
+  int gain;               // Ganancia digital x1 - x64
+};
+
 // ============================================
 // VARIABLES GLOBALES
 // ============================================
@@ -283,6 +297,14 @@ int i2cCount = 0;
 
 UltrasonicConfig ultrasonicSensors[MAX_ULTRASONIC_SENSORS];
 int ultrasonicCount = 0;
+
+AudioConfig audioCfg = {false, -1, -1, -1, 0, 16000, 10, 300, 16};
+bool audioCaptureRequested = false;   // "Grabar ahora" desde el dashboard
+I2SClass i2sMic;
+
+// Hora (epoch) de la última grabación subida. RTC_DATA_ATTR la conserva durante
+// el deep sleep, que reinicia el chip y borraría una variable normal.
+RTC_DATA_ATTR time_t lastAudioCapture = 0;
 
 String deviceMac;
 int deviceId = 0;
@@ -349,6 +371,10 @@ void readUltrasonicSensors();
 void processUltrasonicTriggers();
 float calculateMovementSpeed(int sensorIndex);
 bool isObjectMoving(int sensorIndex);
+// Micrófono I2S
+void applyAudioConfig(JsonVariant cfg);
+bool isAudioCaptureDue();
+bool captureAndUploadAudio();
 // LED RGB
 void blinkRGB(uint8_t r, uint8_t g, uint8_t b, int duration = 50);
 
@@ -555,12 +581,22 @@ void loop() {
       delay(50);
     }
 
+    // Grabación de audio: va después del drenaje para atender también un
+    // "Grabar ahora" que se encoló mientras el dispositivo dormía
+    if (isAudioCaptureDue()) {
+      captureAndUploadAudio();
+    }
+
     // Luego mantener ventana activa para comandos en tiempo real
     Serial.println("⏳ Ventana de comandos abierta (15 segundos)...");
     unsigned long commandWaitStart = millis();
     while (millis() - commandWaitStart < 15000) {
       webSocket.loop();
       delay(100);
+
+      if (audioCaptureRequested) {
+        captureAndUploadAudio();
+      }
 
       if (Serial.available()) {
         handleSerial();
@@ -1323,6 +1359,8 @@ void handleConfig(JsonDocument& doc) {
   Serial.print("Sensores ultrasónicos configurados: ");
   Serial.println(ultrasonicCount);
 
+  applyAudioConfig(doc["audio"]);
+
   // Verificar OTA pendiente
   if (!doc["ota"].isNull()) {
     JsonObject ota = doc["ota"];
@@ -1669,6 +1707,19 @@ void handleCommand(JsonDocument& doc) {
       Serial.printf("⏰ Sleep interval actualizado a %lu segundos (próximo ciclo)\n", deepSleepDuration);
     } else {
       Serial.println("⚠️ Sleep interval mínimo es 5 segundos");
+    }
+  }
+  else if (strcmp(action, "update_audio") == 0) {
+    applyAudioConfig(doc["audio"]);
+  }
+  else if (strcmp(action, "capture_audio") == 0) {
+    // No se graba aquí: esto corre dentro de webSocket.loop() y la grabación
+    // bloquea varios segundos. El loop principal la atiende en cuanto vuelve.
+    if (audioCfg.enabled) {
+      audioCaptureRequested = true;
+      Serial.println("🎙️ Grabación solicitada por el backend");
+    } else {
+      Serial.println("⚠️ Grabación solicitada, pero el micrófono no está activado");
     }
   }
   else if (strcmp(action, "reboot") == 0) {
@@ -2104,6 +2155,227 @@ void processUltrasonicTriggers() {
 }
 
 // ============================================
+// MICRÓFONO I2S (INMP441)
+// ============================================
+
+// Stream que entrega PCM de 16 bits mono leído del micrófono a medida que se
+// pide. HTTPClient lo va leyendo mientras sube el cuerpo, así la grabación se
+// envía en tiempo real y nunca hay que tener el audio entero en RAM (10 s a
+// 16 kHz son 320 KB, más de lo que le queda libre a la C3).
+class I2SMicStream : public Stream {
+public:
+  I2SMicStream(I2SClass& i2s, int channel, int gain, uint32_t sampleRate, size_t totalBytes)
+    : _i2s(i2s), _channel(channel), _gain(gain), _remaining(totalBytes),
+      _warmupFrames(sampleRate / 5) {}
+
+  int available() override {
+    return _remaining > INT32_MAX ? INT32_MAX : (int)_remaining;
+  }
+
+  size_t readBytes(char* buffer, size_t length) override {
+    if (length > _remaining) length = _remaining;
+
+    size_t done = 0;
+    while (done < length) {
+      if (_pos >= _len) refill();
+      size_t n = min(length - done, _len - _pos);
+      memcpy(buffer + done, (uint8_t*)_pcm + _pos, n);
+      _pos += n;
+      done += n;
+    }
+
+    _remaining -= done;
+    return done;
+  }
+
+  int read() override {
+    uint8_t b;
+    return readBytes((char*)&b, 1) == 1 ? b : -1;
+  }
+
+  int peek() override { return -1; }
+  size_t write(uint8_t) override { return 0; }
+
+  int readErrors() const { return _readErrors; }
+
+private:
+  static const int FRAMES = 256;
+
+  I2SClass& _i2s;
+  int _channel;
+  int _gain;
+  size_t _remaining;
+  uint32_t _warmupFrames;
+  int _readErrors = 0;
+
+  int32_t _raw[FRAMES * 2];  // Estéreo intercalado, 24 bits alineados arriba
+  int16_t _pcm[FRAMES];
+  size_t _len = 0;           // Bytes válidos en _pcm
+  size_t _pos = 0;           // Bytes de _pcm ya entregados
+
+  // Estado del filtro que quita la componente continua del micrófono
+  int32_t _xPrev = 0;
+  int32_t _yPrev = 0;
+
+  void refill() {
+    size_t got = _i2s.readBytes((char*)_raw, sizeof(_raw));
+    size_t frames = got / (2 * sizeof(int32_t));
+
+    // HTTPClient ya anunció el Content-Length: si el I2S falla, se rellena con
+    // silencio para no dejar la subida colgada esperando bytes que no llegan.
+    if (frames == 0) {
+      _readErrors++;
+      memset(_pcm, 0, sizeof(_pcm));
+      _len = sizeof(_pcm);
+      _pos = 0;
+      return;
+    }
+
+    for (size_t i = 0; i < frames; i++) {
+      int32_t x = _raw[i * 2 + _channel] >> 8;
+      // Filtro paso alto de un polo: y = x - x[n-1] + 0.995 * y[n-1]
+      int32_t y = x - _xPrev + (int32_t)(((int64_t)_yPrev * 32604) >> 15);
+      _xPrev = x;
+      _yPrev = y;
+
+      int32_t out = (y * _gain) >> 8;  // 24 bits -> 16 bits con ganancia
+      _pcm[i] = (int16_t)constrain(out, -32768, 32767);
+    }
+
+    // El INMP441 entrega ceros durante ~85 ms tras recibir reloj, y el búfer DMA
+    // guarda audio viejo del rato que tardó la conexión TLS: se tira ese tramo
+    // (también sirve para que el filtro se asiente).
+    if (_warmupFrames > 0) {
+      _warmupFrames = _warmupFrames > frames ? _warmupFrames - frames : 0;
+      _len = 0;
+      _pos = 0;
+      return;
+    }
+
+    _len = frames * sizeof(int16_t);
+    _pos = 0;
+  }
+};
+
+void applyAudioConfig(JsonVariant cfg) {
+  if (cfg.isNull()) {
+    audioCfg.enabled = false;
+    return;
+  }
+
+  bool enabled = cfg["enabled"] | false;
+  int sck = cfg["sck_pin"] | -1;
+  int ws  = cfg["ws_pin"]  | -1;
+  int sd  = cfg["sd_pin"]  | -1;
+
+  // Mismo criterio que con los demás sensores: un pin de la flash interna o
+  // repetido podría colgar el chip, así que se rechaza antes de tocar el I2S
+  if (enabled) {
+    bool pinsOk = GPIO_IsValid(sck) && GPIO_IsValid(ws) && GPIO_IsValid(sd) &&
+                  sck != ws && sck != sd && ws != sd;
+    if (!pinsOk) {
+      Serial.printf("[AUDIO] Pines no válidos (SCK:%d WS:%d SD:%d), micrófono desactivado\n", sck, ws, sd);
+      enabled = false;
+    }
+  }
+
+  uint32_t rate = cfg["sample_rate"] | 16000;
+
+  audioCfg.enabled     = enabled;
+  audioCfg.sckPin      = sck;
+  audioCfg.wsPin       = ws;
+  audioCfg.sdPin       = sd;
+  audioCfg.channel     = (cfg["channel"] | 0) == 1 ? 1 : 0;
+  audioCfg.sampleRate  = (rate == 8000) ? 8000 : 16000;
+  audioCfg.durationSec = constrain((int)(cfg["duration_sec"] | 10), 1, 30);
+  audioCfg.intervalSec = cfg["capture_interval_sec"] | 300;
+  audioCfg.gain        = constrain((int)(cfg["gain"] | 16), 1, 64);
+
+  if (audioCfg.enabled) {
+    Serial.printf("🎙️ Micrófono: SCK:%d WS:%d SD:%d canal:%s, %u s a %lu Hz cada %lu s, ganancia x%d\n",
+                  sck, ws, sd, audioCfg.channel ? "der" : "izq",
+                  audioCfg.durationSec, (unsigned long)audioCfg.sampleRate,
+                  (unsigned long)audioCfg.intervalSec, audioCfg.gain);
+  } else {
+    Serial.println("🎙️ Micrófono desactivado");
+  }
+}
+
+bool isAudioCaptureDue() {
+  if (!audioCfg.enabled) return false;
+  if (audioCaptureRequested || audioCfg.intervalSec == 0) return true;
+
+  // Sin hora fiable (o si el reloj retrocedió) no hay forma de medir el
+  // intervalo: se graba en vez de quedarse sin audio indefinidamente
+  time_t now = time(nullptr);
+  if (now < 1700000000 || lastAudioCapture == 0 || now < lastAudioCapture) return true;
+
+  return (now - lastAudioCapture) >= (time_t)audioCfg.intervalSec;
+}
+
+bool captureAndUploadAudio() {
+  audioCaptureRequested = false;
+  if (!audioCfg.enabled) return false;
+
+  size_t totalBytes = (size_t)audioCfg.sampleRate * audioCfg.durationSec * sizeof(int16_t);
+
+  Serial.printf("🎙️ Grabando %u s de audio y subiéndolo (%u bytes)...\n",
+                audioCfg.durationSec, (unsigned)totalBytes);
+
+  // Se lee en estéreo y se toma un canal: es lo que se probó con el INMP441 y
+  // evita depender de qué ranura elige cada chip en modo mono
+  i2sMic.setPins(audioCfg.sckPin, audioCfg.wsPin, -1, audioCfg.sdPin);
+  if (!i2sMic.begin(I2S_MODE_STD, audioCfg.sampleRate, I2S_DATA_BIT_WIDTH_32BIT, I2S_SLOT_MODE_STEREO)) {
+    Serial.println("❌ No se pudo iniciar el I2S del micrófono");
+    return false;
+  }
+
+  I2SMicStream* mic = new I2SMicStream(i2sMic, audioCfg.channel, audioCfg.gain,
+                                       audioCfg.sampleRate, totalBytes);
+
+  String url = String("http") + (BACKEND_PORT == 443 ? "s" : "") + "://" +
+               BACKEND_HOST + ":" + String(BACKEND_PORT) + "/api/audio/upload";
+
+  HTTPClient http;
+  http.begin(url);
+  http.setTimeout(15000);
+  http.addHeader("Content-Type", "application/octet-stream");
+  http.addHeader("X-Device-Mac", deviceMac);
+  http.addHeader("X-Sample-Rate", String(audioCfg.sampleRate));
+  // En cabecera y no en la URL, para que no quede en los logs del proxy
+  if (DEVICE_TOKEN.length() > 0) {
+    http.addHeader("X-Device-Token", DEVICE_TOKEN);
+  }
+
+  // Durante la subida no se llama a webSocket.loop(): sin esto el heartbeat
+  // daría el socket por muerto y el dispositivo perdería el registro
+  webSocket.disableHeartbeat();
+  unsigned long start = millis();
+  int httpCode = http.sendRequest("POST", mic, totalBytes);
+  unsigned long elapsed = millis() - start;
+  webSocket.enableHeartbeat(15000, 3000, 2);
+
+  int readErrors = mic->readErrors();
+  http.end();
+  i2sMic.end();
+  delete mic;
+
+  if (readErrors > 0) {
+    Serial.printf("⚠️ %d lecturas del micrófono fallaron (se enviaron como silencio)\n", readErrors);
+  }
+
+  if (httpCode == 200 || httpCode == 201) {
+    lastAudioCapture = time(nullptr);
+    Serial.printf("✅ Audio subido en %lu ms\n", elapsed);
+    blinkRGB(0, 255, 0);
+    return true;
+  }
+
+  Serial.printf("❌ Error subiendo audio (HTTP %d: %s)\n", httpCode, http.errorToString(httpCode).c_str());
+  return false;
+}
+
+// ============================================
 // OTA
 // ============================================
 
@@ -2397,6 +2669,13 @@ void handleSerial() {
     Serial.println(gpioCount);
     Serial.print("DHT: ");
     Serial.println(dhtCount);
+    if (audioCfg.enabled) {
+      Serial.printf("Micrófono: SCK:%d WS:%d SD:%d, %u s cada %lu s\n",
+                    audioCfg.sckPin, audioCfg.wsPin, audioCfg.sdPin,
+                    audioCfg.durationSec, (unsigned long)audioCfg.intervalSec);
+    } else {
+      Serial.println("Micrófono: desactivado");
+    }
     Serial.println("--------------\n");
   }
   else if (cmd == "reboot") {
