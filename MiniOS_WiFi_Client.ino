@@ -548,6 +548,10 @@ void loop() {
     while (!isRegistered && millis() - wsStart < 10000) {
       webSocket.loop();
       delay(100);
+
+      if (Serial.available()) {
+        handleSerial();
+      }
     }
 
     if (!isRegistered) {
@@ -613,7 +617,20 @@ void loop() {
     enterDeepSleep(deepSleepDuration);
   } else {
     Serial.println("💡 Deep Sleep deshabilitado, esperando...");
-    delay(deepSleepDuration * 1000);
+
+    // Con delay() el monitor serie solo se leía al empezar cada ciclo y en la
+    // ventana de comandos, que solo existe si el backend responde: sin backend,
+    // los comandos (server, token...) se ignoraban casi siempre. webSocket.loop()
+    // además permite registrarse en cuanto el backend vuelva o cambie el server.
+    unsigned long idleStart = millis();
+    while (millis() - idleStart < deepSleepDuration * 1000UL) {
+      webSocket.loop();
+
+      if (Serial.available()) {
+        handleSerial();
+      }
+      delay(20);
+    }
     taskCompleted = false;  // Repetir ciclo
   }
 }
