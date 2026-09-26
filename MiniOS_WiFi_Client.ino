@@ -2181,9 +2181,9 @@ void processUltrasonicTriggers() {
 // 16 kHz son 320 KB, más de lo que le queda libre a la C3).
 class I2SMicStream : public Stream {
 public:
-  I2SMicStream(I2SClass& i2s, int channel, int gain, uint32_t sampleRate, size_t totalBytes)
+  I2SMicStream(I2SClass& i2s, int channel, int gain, uint32_t flushFrames, size_t totalBytes)
     : _i2s(i2s), _channel(channel), _gain(gain), _remaining(totalBytes),
-      _warmupFrames(sampleRate / 5) {}
+      _flushFrames(flushFrames) {}
 
   int available() override {
     return _remaining > INT32_MAX ? INT32_MAX : (int)_remaining;
@@ -2214,6 +2214,7 @@ public:
   size_t write(uint8_t) override { return 0; }
 
   int readErrors() const { return _readErrors; }
+  int peak() const { return _peak; }  // Pico de lo enviado (0-32767)
 
 private:
   static const int FRAMES = 256;
@@ -2222,8 +2223,9 @@ private:
   int _channel;
   int _gain;
   size_t _remaining;
-  uint32_t _warmupFrames;
+  uint32_t _flushFrames;
   int _readErrors = 0;
+  int _peak = 0;
 
   int32_t _raw[FRAMES * 2];  // Estéreo intercalado, 24 bits alineados arriba
   int16_t _pcm[FRAMES];
@@ -2248,6 +2250,11 @@ private:
       return;
     }
 
+    // El búfer DMA guarda audio viejo del rato que tardó la conexión TLS y
+    // termina en un salto: se tira ese tramo. El filtro sí lo procesa, para
+    // llegar asentado al audio que se envía.
+    bool flushing = _flushFrames > 0;
+
     for (size_t i = 0; i < frames; i++) {
       int32_t x = _raw[i * 2 + _channel] >> 8;
       // Filtro paso alto de un polo: y = x - x[n-1] + 0.995 * y[n-1]
@@ -2255,15 +2262,14 @@ private:
       _xPrev = x;
       _yPrev = y;
 
-      int32_t out = (y * _gain) >> 8;  // 24 bits -> 16 bits con ganancia
-      _pcm[i] = (int16_t)constrain(out, -32768, 32767);
+      int32_t out = constrain((y * _gain) >> 8, -32768, 32767);  // 24 -> 16 bits con ganancia
+      _pcm[i] = (int16_t)out;
+      int mag = out < 0 ? -(int)out : (int)out;
+      if (!flushing && mag > _peak) _peak = mag;
     }
 
-    // El INMP441 entrega ceros durante ~85 ms tras recibir reloj, y el búfer DMA
-    // guarda audio viejo del rato que tardó la conexión TLS: se tira ese tramo
-    // (también sirve para que el filtro se asiente).
-    if (_warmupFrames > 0) {
-      _warmupFrames = _warmupFrames > frames ? _warmupFrames - frames : 0;
+    if (flushing) {
+      _flushFrames = _flushFrames > frames ? _flushFrames - frames : 0;
       _len = 0;
       _pos = 0;
       return;
@@ -2330,6 +2336,42 @@ bool isAudioCaptureDue() {
   return (now - lastAudioCapture) >= (time_t)audioCfg.intervalSec;
 }
 
+// El INMP441 no entrega datos válidos hasta 2^18 ciclos de SCK tras recibir
+// reloj. Con 64 ciclos por trama estéreo son 4096 tramas: 256 ms a 16 kHz y
+// 512 ms a 8 kHz. Se deja algo de margen.
+#define MIC_STARTUP_FRAMES 4608
+#define MIC_PROBE_FRAMES   2048   // Tramas para ver qué canal trae señal
+#define MIC_FLUSH_FRAMES   2048   // Audio viejo del búfer DMA a descartar (>= 6 x 240)
+#define MIC_SILENT_RANGE   2      // Rango de un canal sin micrófono: valor constante
+
+// Lee `frames` tramas y devuelve en range[] cuánto varía cada canal (24 bits).
+// Un canal por el que no habla ningún micrófono da un valor constante: el pin
+// SD queda en alta impedancia en esa ranura.
+bool probeMicChannels(size_t frames, int32_t range[2]) {
+  static int32_t buf[256 * 2];
+  int32_t lo[2] = {INT32_MAX, INT32_MAX};
+  int32_t hi[2] = {INT32_MIN, INT32_MIN};
+
+  size_t done = 0;
+  while (done < frames) {
+    size_t got = i2sMic.readBytes((char*)buf, sizeof(buf)) / (2 * sizeof(int32_t));
+    if (got == 0) return false;
+
+    for (size_t i = 0; i < got; i++) {
+      for (int c = 0; c < 2; c++) {
+        int32_t v = buf[i * 2 + c] >> 8;
+        if (v < lo[c]) lo[c] = v;
+        if (v > hi[c]) hi[c] = v;
+      }
+    }
+    done += got;
+  }
+
+  range[0] = hi[0] - lo[0];
+  range[1] = hi[1] - lo[1];
+  return true;
+}
+
 bool captureAndUploadAudio() {
   audioCaptureRequested = false;
   if (!audioCfg.enabled) return false;
@@ -2347,8 +2389,37 @@ bool captureAndUploadAudio() {
     return false;
   }
 
-  I2SMicStream* mic = new I2SMicStream(i2sMic, audioCfg.channel, audioCfg.gain,
-                                       audioCfg.sampleRate, totalBytes);
+  // Antes de subir nada se comprueba que el micrófono entrega datos. Con el
+  // L/R sin conectar el micrófono puede acabar en cualquier canal, y antes eso
+  // producía grabaciones de silencio absoluto sin ningún aviso.
+  int32_t range[2];
+  if (!probeMicChannels(MIC_STARTUP_FRAMES, range) || !probeMicChannels(MIC_PROBE_FRAMES, range)) {
+    Serial.println("❌ El I2S no entrega datos (lectura agotada). Revisa SCK y WS.");
+    i2sMic.end();
+    return false;
+  }
+
+  Serial.printf("🎙️ Señal por canal (rango 24 bits): izq %ld, der %ld\n", (long)range[0], (long)range[1]);
+
+  int channel = audioCfg.channel;
+  if (range[channel] <= MIC_SILENT_RANGE) {
+    if (range[1 - channel] > MIC_SILENT_RANGE) {
+      Serial.printf("⚠️ El micrófono está en el canal %s y la config dice %s: se usa el %s.\n",
+                    channel ? "izquierdo" : "derecho", channel ? "derecho" : "izquierdo",
+                    channel ? "izquierdo" : "derecho");
+      Serial.println("   Conecta L/R a GND (izquierdo) o a 3.3 (derecho) para que no cambie solo.");
+      channel = 1 - channel;
+    } else {
+      Serial.println("❌ Ningún canal trae señal: el micrófono no está hablando.");
+      Serial.printf("   Revisa VDD a 3.3, GND, y que SD vaya al GPIO %d, SCK al %d y WS al %d.\n",
+                    audioCfg.sdPin, audioCfg.sckPin, audioCfg.wsPin);
+      i2sMic.end();
+      return false;
+    }
+  }
+
+  I2SMicStream* mic = new I2SMicStream(i2sMic, channel, audioCfg.gain,
+                                       MIC_FLUSH_FRAMES, totalBytes);
 
   String url = String("http") + (BACKEND_PORT == 443 ? "s" : "") + "://" +
                BACKEND_HOST + ":" + String(BACKEND_PORT) + "/api/audio/upload";
@@ -2373,6 +2444,7 @@ bool captureAndUploadAudio() {
   webSocket.enableHeartbeat(15000, 3000, 2);
 
   int readErrors = mic->readErrors();
+  int peak = mic->peak();
   http.end();
   i2sMic.end();
   delete mic;
@@ -2383,7 +2455,13 @@ bool captureAndUploadAudio() {
 
   if (httpCode == 200 || httpCode == 201) {
     lastAudioCapture = time(nullptr);
-    Serial.printf("✅ Audio subido en %lu ms\n", elapsed);
+    Serial.printf("✅ Audio subido en %lu ms · pico %.1f dBFS\n", elapsed,
+                  peak > 0 ? 20.0f * log10f(peak / 32768.0f) : -96.0f);
+    if (peak >= 32767) {
+      Serial.println("   Ha saturado: baja la ganancia desde el dashboard.");
+    } else if (peak < 100) {
+      Serial.println("   Se oirá muy bajo: sube la ganancia desde el dashboard.");
+    }
     blinkRGB(0, 255, 0);
     return true;
   }
