@@ -351,6 +351,7 @@ void handleCommand(JsonDocument& doc);
 void sendSensorData();
 void readDHTSensors();
 void readI2CSensors();
+void configureI2CSensors(JsonArray arr);
 void processGpioLoops();
 void startOTA(int id, String filename, int filesize, String checksum);
 void reportOTAStatus(const char* status, String error);
@@ -1203,105 +1204,7 @@ void handleConfig(JsonDocument& doc) {
   Serial.println(dhtCount);
 
   // Configurar sensores I2C
-  JsonArray i2cArray = doc["i2c"].as<JsonArray>();
-
-  // Limpiar sensores anteriores
-  for (int i = 0; i < i2cCount; i++) {
-    if (i2cSensors[i].aht) delete i2cSensors[i].aht;
-    if (i2cSensors[i].bmp) delete i2cSensors[i].bmp;
-    if (i2cSensors[i].bme) delete i2cSensors[i].bme;
-  }
-  i2cCount = 0;
-
-  for (JsonObject i2c : i2cArray) {
-    if (i2cCount >= MAX_I2C_SENSORS) break;
-
-    String sensorType = i2c["sensor_type"].as<String>();
-    uint8_t address = i2c["i2c_address"] | 0x00;
-
-    i2cSensors[i2cCount].id = i2c["id"];
-    i2cSensors[i2cCount].name = i2c["name"].as<String>();
-    i2cSensors[i2cCount].sensorType = sensorType;
-    i2cSensors[i2cCount].i2cAddress = address;
-    i2cSensors[i2cCount].active = i2c["active"] | true;
-    i2cSensors[i2cCount].readInterval = i2c["read_interval"] | 5000;
-    i2cSensors[i2cCount].lastRead = 0;
-    i2cSensors[i2cCount].temperature = 0;
-    i2cSensors[i2cCount].humidity = 0;
-    i2cSensors[i2cCount].pressure = 0;
-    i2cSensors[i2cCount].altitude = 0;
-    i2cSensors[i2cCount].aht = nullptr;
-    i2cSensors[i2cCount].bmp = nullptr;
-    i2cSensors[i2cCount].bme = nullptr;
-
-    // Inicializar sensor según tipo (con 3 reintentos y 100ms entre ellos)
-    bool sensorOk = false;
-    if (sensorType == "AHT20") {
-      i2cSensors[i2cCount].aht = new Adafruit_AHTX0();
-      for (int attempt = 0; attempt < 3 && !sensorOk; attempt++) {
-        if (attempt > 0) delay(100);
-        sensorOk = i2cSensors[i2cCount].aht->begin(&Wire, 0, address);
-      }
-      if (sensorOk) {
-        Serial.printf("✅ AHT20 inicializado en 0x%02X\n", address);
-      } else {
-        Serial.printf("❌ Error inicializando AHT20 en 0x%02X (verifique cableado y dirección)\n", address);
-        delete i2cSensors[i2cCount].aht;
-        i2cSensors[i2cCount].aht = nullptr;
-        continue;
-      }
-    }
-    else if (sensorType == "BMP280") {
-      i2cSensors[i2cCount].bmp = new Adafruit_BMP280();
-      for (int attempt = 0; attempt < 3 && !sensorOk; attempt++) {
-        if (attempt > 0) delay(100);
-        sensorOk = i2cSensors[i2cCount].bmp->begin(address);
-      }
-      if (sensorOk) {
-        Serial.printf("✅ BMP280 inicializado en 0x%02X\n", address);
-        i2cSensors[i2cCount].bmp->setSampling(
-          Adafruit_BMP280::MODE_NORMAL,
-          Adafruit_BMP280::SAMPLING_X2,
-          Adafruit_BMP280::SAMPLING_X16,
-          Adafruit_BMP280::FILTER_X16,
-          Adafruit_BMP280::STANDBY_MS_500
-        );
-      } else {
-        Serial.printf("❌ Error inicializando BMP280 en 0x%02X (verifique cableado y dirección)\n", address);
-        delete i2cSensors[i2cCount].bmp;
-        i2cSensors[i2cCount].bmp = nullptr;
-        continue;
-      }
-    }
-    else if (sensorType == "BME280") {
-      i2cSensors[i2cCount].bme = new Adafruit_BME280();
-      for (int attempt = 0; attempt < 3 && !sensorOk; attempt++) {
-        if (attempt > 0) delay(100);
-        sensorOk = i2cSensors[i2cCount].bme->begin(address, &Wire);
-      }
-      if (sensorOk) {
-        Serial.printf("✅ BME280 inicializado en 0x%02X\n", address);
-        i2cSensors[i2cCount].bme->setSampling(
-          Adafruit_BME280::MODE_NORMAL,
-          Adafruit_BME280::SAMPLING_X2,
-          Adafruit_BME280::SAMPLING_X16,
-          Adafruit_BME280::SAMPLING_X16,
-          Adafruit_BME280::FILTER_X16,
-          Adafruit_BME280::STANDBY_MS_500
-        );
-      } else {
-        Serial.printf("❌ Error inicializando BME280 en 0x%02X (verifique cableado y dirección)\n", address);
-        delete i2cSensors[i2cCount].bme;
-        i2cSensors[i2cCount].bme = nullptr;
-        continue;
-      }
-    }
-
-    i2cCount++;
-  }
-
-  Serial.print("Sensores I2C configurados: ");
-  Serial.println(i2cCount);
+  configureI2CSensors(doc["i2c"].as<JsonArray>());
 
   // Configurar sensores ultrasónicos
   JsonArray ultrasonicArray = doc["ultrasonic"].as<JsonArray>();
@@ -1613,102 +1516,7 @@ void handleCommand(JsonDocument& doc) {
   }
   else if (strcmp(action, "update_i2c") == 0) {
     Serial.println("📥 Recibida actualización de I2C");
-
-    // Liberar sensores anteriores
-    for (int i = 0; i < i2cCount; i++) {
-      if (i2cSensors[i].aht) { delete i2cSensors[i].aht; i2cSensors[i].aht = nullptr; }
-      if (i2cSensors[i].bmp) { delete i2cSensors[i].bmp; i2cSensors[i].bmp = nullptr; }
-      if (i2cSensors[i].bme) { delete i2cSensors[i].bme; i2cSensors[i].bme = nullptr; }
-    }
-    i2cCount = 0;
-
-    JsonArray i2cArray = doc["i2c"].as<JsonArray>();
-    for (JsonObject i2c : i2cArray) {
-      if (i2cCount >= MAX_I2C_SENSORS) break;
-
-      String sensorType = i2c["sensor_type"].as<String>();
-      uint8_t address   = i2c["i2c_address"] | 0x00;
-
-      i2cSensors[i2cCount].id          = i2c["id"];
-      i2cSensors[i2cCount].name        = i2c["name"].as<String>();
-      i2cSensors[i2cCount].sensorType  = sensorType;
-      i2cSensors[i2cCount].i2cAddress  = address;
-      i2cSensors[i2cCount].active      = i2c["active"] | true;
-      i2cSensors[i2cCount].readInterval = i2c["read_interval"] | 5000;
-      i2cSensors[i2cCount].lastRead    = 0;
-      i2cSensors[i2cCount].temperature = 0;
-      i2cSensors[i2cCount].humidity    = 0;
-      i2cSensors[i2cCount].pressure    = 0;
-      i2cSensors[i2cCount].altitude    = 0;
-      i2cSensors[i2cCount].aht         = nullptr;
-      i2cSensors[i2cCount].bmp         = nullptr;
-      i2cSensors[i2cCount].bme         = nullptr;
-
-      bool sensorOk2 = false;
-      if (sensorType == "AHT20") {
-        i2cSensors[i2cCount].aht = new Adafruit_AHTX0();
-        for (int attempt = 0; attempt < 3 && !sensorOk2; attempt++) {
-          if (attempt > 0) delay(100);
-          sensorOk2 = i2cSensors[i2cCount].aht->begin(&Wire, 0, address);
-        }
-        if (sensorOk2) {
-          Serial.printf("✅ AHT20 inicializado en 0x%02X\n", address);
-        } else {
-          Serial.printf("❌ Error inicializando AHT20 en 0x%02X\n", address);
-          delete i2cSensors[i2cCount].aht;
-          i2cSensors[i2cCount].aht = nullptr;
-          continue;
-        }
-      }
-      else if (sensorType == "BMP280") {
-        i2cSensors[i2cCount].bmp = new Adafruit_BMP280();
-        for (int attempt = 0; attempt < 3 && !sensorOk2; attempt++) {
-          if (attempt > 0) delay(100);
-          sensorOk2 = i2cSensors[i2cCount].bmp->begin(address);
-        }
-        if (sensorOk2) {
-          i2cSensors[i2cCount].bmp->setSampling(
-            Adafruit_BMP280::MODE_NORMAL,
-            Adafruit_BMP280::SAMPLING_X2,
-            Adafruit_BMP280::SAMPLING_X16,
-            Adafruit_BMP280::FILTER_X16,
-            Adafruit_BMP280::STANDBY_MS_500
-          );
-          Serial.printf("✅ BMP280 inicializado en 0x%02X\n", address);
-        } else {
-          Serial.printf("❌ Error inicializando BMP280 en 0x%02X\n", address);
-          delete i2cSensors[i2cCount].bmp;
-          i2cSensors[i2cCount].bmp = nullptr;
-          continue;
-        }
-      }
-      else if (sensorType == "BME280") {
-        i2cSensors[i2cCount].bme = new Adafruit_BME280();
-        for (int attempt = 0; attempt < 3 && !sensorOk2; attempt++) {
-          if (attempt > 0) delay(100);
-          sensorOk2 = i2cSensors[i2cCount].bme->begin(address, &Wire);
-        }
-        if (sensorOk2) {
-          i2cSensors[i2cCount].bme->setSampling(
-            Adafruit_BME280::MODE_NORMAL,
-            Adafruit_BME280::SAMPLING_X2,
-            Adafruit_BME280::SAMPLING_X16,
-            Adafruit_BME280::SAMPLING_X16,
-            Adafruit_BME280::FILTER_X16,
-            Adafruit_BME280::STANDBY_MS_500
-          );
-          Serial.printf("✅ BME280 inicializado en 0x%02X\n", address);
-        } else {
-          Serial.printf("❌ Error inicializando BME280 en 0x%02X\n", address);
-          delete i2cSensors[i2cCount].bme;
-          i2cSensors[i2cCount].bme = nullptr;
-          continue;
-        }
-      }
-
-      i2cCount++;
-    }
-    Serial.printf("Sensores I2C actualizados: %d\n", i2cCount);
+    configureI2CSensors(doc["i2c"].as<JsonArray>());
   }
   else if (strcmp(action, "scan_i2c") == 0) {
     Serial.println("🔍 Escaneo I2C solicitado por backend");
@@ -1915,6 +1723,152 @@ void readDHTSensors() {
 // SENSORES I2C
 // ============================================
 
+// Registro 0xD0 de los sensores Bosch: 0x56/0x57/0x58 = BMP280, 0x60 = BME280.
+// Devuelve 0 si nada responde en esa dirección.
+uint8_t readBoschChipId(uint8_t address) {
+  Wire.beginTransmission(address);
+  Wire.write(0xD0);
+  if (Wire.endTransmission(false) != 0) return 0;
+  if (Wire.requestFrom(address, (uint8_t)1) != 1) return 0;
+  return Wire.read();
+}
+
+bool isBmp280ChipId(uint8_t id) {
+  return id == 0x56 || id == 0x57 || id == 0x58;
+}
+
+// Inicializa un sensor I2C ya rellenado en `s`. Devuelve false con el motivo
+// impreso por serie.
+bool initI2CSensor(I2CConfig& s) {
+  uint8_t address = s.i2cAddress;
+
+  if (s.sensorType == "AHT20") {
+    s.aht = new Adafruit_AHTX0();
+    for (int attempt = 0; attempt < 3; attempt++) {
+      if (attempt > 0) delay(100);
+      if (s.aht->begin(&Wire, 0, address)) return true;
+    }
+    Serial.printf("❌ AHT20: nada responde en 0x%02X. Revisa SDA/SCL.\n", address);
+    return false;
+  }
+
+  if (s.sensorType != "BMP280" && s.sensorType != "BME280") {
+    Serial.printf("❌ Tipo de sensor I2C desconocido: %s\n", s.sensorType.c_str());
+    return false;
+  }
+
+  uint8_t chipId = 0;
+  for (int attempt = 0; attempt < 3 && chipId == 0; attempt++) {
+    if (attempt > 0) delay(100);
+    chipId = readBoschChipId(address);
+  }
+
+  if (chipId == 0) {
+    Serial.printf("❌ %s: nada responde en 0x%02X. Revisa SDA/SCL o prueba la otra dirección (0x76 / 0x77).\n",
+                  s.sensorType.c_str(), address);
+    return false;
+  }
+
+  if (s.sensorType == "BMP280") {
+    if (chipId == 0x60) {
+      // Un BME280 tiene los mismos registros de temperatura y presión
+      Serial.printf("⚠️ En 0x%02X hay un BME280, no un BMP280: se lee sin humedad. Cámbialo a BME280 en el dashboard.\n", address);
+    } else if (!isBmp280ChipId(chipId)) {
+      Serial.printf("❌ En 0x%02X hay un chip desconocido (ID 0x%02X), no un BMP280.\n", address, chipId);
+      return false;
+    }
+
+    // begin() solo acepta un ID concreto (0x58 por defecto). Muchos módulos
+    // AHT20 + BMP280 traen BMP280 con ID 0x56 o 0x57 y fallaban aquí aunque el
+    // cableado estuviera bien: se le pasa el ID que se ha leído
+    s.bmp = new Adafruit_BMP280();
+    if (!s.bmp->begin(address, chipId)) {
+      Serial.printf("❌ BMP280 en 0x%02X (ID 0x%02X) no se pudo inicializar.\n", address, chipId);
+      return false;
+    }
+    s.bmp->setSampling(
+      Adafruit_BMP280::MODE_NORMAL,
+      Adafruit_BMP280::SAMPLING_X2,
+      Adafruit_BMP280::SAMPLING_X16,
+      Adafruit_BMP280::FILTER_X16,
+      Adafruit_BMP280::STANDBY_MS_500
+    );
+    return true;
+  }
+
+  // BME280
+  if (isBmp280ChipId(chipId)) {
+    Serial.printf("❌ En 0x%02X hay un BMP280 (ID 0x%02X), no un BME280: cámbialo a BMP280 en el dashboard.\n",
+                  address, chipId);
+    return false;
+  }
+  if (chipId != 0x60) {
+    Serial.printf("❌ En 0x%02X hay un chip desconocido (ID 0x%02X), no un BME280.\n", address, chipId);
+    return false;
+  }
+
+  s.bme = new Adafruit_BME280();
+  if (!s.bme->begin(address, &Wire)) {
+    Serial.printf("❌ BME280 en 0x%02X no se pudo inicializar.\n", address);
+    return false;
+  }
+  s.bme->setSampling(
+    Adafruit_BME280::MODE_NORMAL,
+    Adafruit_BME280::SAMPLING_X2,
+    Adafruit_BME280::SAMPLING_X16,
+    Adafruit_BME280::SAMPLING_X16,
+    Adafruit_BME280::FILTER_X16,
+    Adafruit_BME280::STANDBY_MS_500
+  );
+  return true;
+}
+
+// Reemplaza la lista de sensores I2C. La usan tanto el config inicial como
+// update_i2c: antes cada uno tenía su propia copia de este código.
+void configureI2CSensors(JsonArray arr) {
+  for (int i = 0; i < i2cCount; i++) {
+    delete i2cSensors[i].aht; i2cSensors[i].aht = nullptr;
+    delete i2cSensors[i].bmp; i2cSensors[i].bmp = nullptr;
+    delete i2cSensors[i].bme; i2cSensors[i].bme = nullptr;
+  }
+  i2cCount = 0;
+
+  for (JsonObject i2c : arr) {
+    if (i2cCount >= MAX_I2C_SENSORS) {
+      Serial.printf("⚠️ Máximo %d sensores I2C: se ignoran los demás\n", MAX_I2C_SENSORS);
+      break;
+    }
+
+    I2CConfig& s = i2cSensors[i2cCount];
+    s.id           = i2c["id"];
+    s.name         = i2c["name"].as<String>();
+    s.sensorType   = i2c["sensor_type"].as<String>();
+    s.i2cAddress   = i2c["i2c_address"] | 0x00;
+    s.active       = i2c["active"] | true;
+    s.readInterval = i2c["read_interval"] | 5000;
+    s.lastRead     = 0;
+    s.temperature  = 0;
+    s.humidity     = 0;
+    s.pressure     = 0;
+    s.altitude     = 0;
+    s.aht = nullptr;
+    s.bmp = nullptr;
+    s.bme = nullptr;
+
+    if (!initI2CSensor(s)) {
+      delete s.aht; s.aht = nullptr;
+      delete s.bmp; s.bmp = nullptr;
+      delete s.bme; s.bme = nullptr;
+      continue;
+    }
+
+    Serial.printf("✅ %s inicializado en 0x%02X\n", s.sensorType.c_str(), s.i2cAddress);
+    i2cCount++;
+  }
+
+  Serial.printf("Sensores I2C configurados: %d\n", i2cCount);
+}
+
 void readI2CSensors() {
   for (int i = 0; i < i2cCount; i++) {
     if (!i2cSensors[i].active) continue;
@@ -1970,13 +1924,10 @@ void scanAndReportI2C() {
       const char* type = "Unknown";
       if (addr == 0x38) type = "AHT20";
       else if (addr == 0x76 || addr == 0x77) {
-        // Leer chip ID (registro 0xD0): BMP280=0x58, BME280=0x60
-        Wire.beginTransmission(addr);
-        Wire.write(0xD0);
-        Wire.endTransmission(false);
-        Wire.requestFrom(addr, (uint8_t)1);
-        uint8_t chipId = Wire.available() ? Wire.read() : 0;
-        type = (chipId == 0x60) ? "BME280" : "BMP280";
+        uint8_t chipId = readBoschChipId(addr);
+        dev["chip_id"] = chipId;
+        if (chipId == 0x60) type = "BME280";
+        else if (isBmp280ChipId(chipId)) type = "BMP280";
       }
       else if (addr == 0x23) type = "BH1750";
       else if (addr == 0x48) type = "ADS1115";
